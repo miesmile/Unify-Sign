@@ -23,9 +23,6 @@ module.exports = function (default_config, config, CONFIG_STORAGE_NAME) {
     'collect_btn_taobao', 'entry_check_taobao', 'task_btn_taobao'
   ])
 
-  // 米哈游签到
-  binder.bindCustomSignConfig('mihoyo', {}, ['reward_icon'])
-
   // 京东签到
   binder.bindCustomSignConfig('jingdong', {
     // 签到领豆按钮

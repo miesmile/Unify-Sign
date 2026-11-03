@@ -13,10 +13,10 @@ custom_config = custom_config || { supported_signs: [] }
 let default_config = {
   record_failed_info: false,
   not_lingering_float_window: true,
-  github_url: 'https://github.com/TonyJiangWJ/Unify-Sign',
+  github_url: 'https://github.com/miesmile/Unify-Sign',
   // github release url 用于检测更新状态
-  github_latest_url: 'https://api.github.com/repos/TonyJiangWJ/Unify-Sign/releases/latest',
-  history_tag_url: 'https://api.github.com/repos/TonyJiangWJ/Unify-Sign/tags',
+  github_latest_url: 'https://api.github.com/repos/miesmile/Unify-Sign/releases/latest',
+  history_tag_url: 'https://api.github.com/repos/miesmile/Unify-Sign/tags',
   killAppWithGesture: true,
   thread_name_prefix: 'unify_sign_',
   notificationId: 113,
@@ -73,12 +73,6 @@ let default_config = {
       ]
     },
     {
-      name: '米游社-原神签到',
-      taskCode: 'MiHoYo',
-      script: 'MiHoYou.js',
-      enabled: true
-    },
-    {
       name: '淘金币签到',
       taskCode: 'Taobao',
       script: 'Taobao-Coin.js',
@@ -127,51 +121,9 @@ let default_config = {
       enabled: true
     },
     {
-      name: '什么值得买',
-      taskCode: 'Smzdm',
-      script: 'Smzdm.js',
-      enabled: true
-    },
-    {
       name: '支付宝商家积分签到',
       taskCode: 'AlipayMerchant',
       script: 'AlipayMerchantCredits.js',
-      enabled: true
-    },
-    {
-      name: '小米商城米金',
-      taskCode: 'XiaomiShop',
-      script: 'XiaomiShop.js',
-      enabled: true
-    },
-    {
-      name: '华住会签到',
-      taskCode: 'HuaZhu',
-      script: 'HuaZhu.js',
-      enabled: true
-    },
-    {
-      name: '小米钱包',
-      taskCode: 'XiaomiWallet',
-      script: 'XiaomiWallet.js',
-      enabled: true
-    },
-    {
-      name: '阿里云盘',
-      taskCode: 'AliCloudDrive',
-      script: 'AliCloudDrive.js',
-      enabled: true
-    },
-    {
-      name: '一嗨签到',
-      taskCode: 'EHai',
-      script: 'Ehai.js',
-      enabled: true
-    },
-    {
-      name: '网上国网',
-      taskCode: 'wsgw',
-      script: 'WangShangGuoWang.js',
       enabled: true
     }
   ].concat(custom_config.supported_signs || [])

@@ -101,12 +101,6 @@ const SignConfig = {
             ]
           },
           {
-            name: '米游社-原神签到',
-            taskCode: 'MiHoYo',
-            script: 'MiHoYou.js',
-            enabled: true
-          },
-          {
             name: '淘金币签到',
             taskCode: 'Taobao',
             script: 'Taobao-Coin.js',
@@ -153,7 +147,6 @@ const SignConfig = {
         'DingDong': '/basic/sign/dingdong',
         'Weibo': '/basic/sign/weibo',
         'BBFarm': '/basic/sign/bbFarm',
-        'MiHoYo': '/basic/sign/mihoyo',
         'JingDong': '/basic/sign/jingdong',
       }
     }

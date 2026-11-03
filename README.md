@@ -1,7 +1,6 @@
-[![GitHub forks](https://img.shields.io/github/forks/TonyJiangWJ/Unify-Sign?style=flat-square)](https://github.com/TonyJiangWJ/Unify-Sign/forks)
-[![GitHub stars](https://img.shields.io/github/stars/TonyJiangWJ/Unify-Sign?style=flat-square)](https://github.com/TonyJiangWJ/Unify-Sign/stargazers)
-[![GitHub issues](https://img.shields.io/github/issues/TonyJiangWJ/Unify-Sign?style=flat-square)](https://github.com/TonyJiangWJ/Unify-Sign/issues)
-[![Page Views Count](https://badges.toozhao.com/badges/01HV8RTJSBDZVMS36ZWQR470XM/green.svg)](https://badges.toozhao.com/stats/01HV8RTJSBDZVMS36ZWQR470XM "Get your own page views count badge on badges.toozhao.com")
+[![GitHub forks](https://img.shields.io/github/forks/miesmile/Unify-Sign?style=flat-square)](https://github.com/miesmile/Unify-Sign/forks)
+[![GitHub stars](https://img.shields.io/github/stars/miesmile/Unify-Sign?style=flat-square)](https://github.com/miesmile/Unify-Sign/stargazers)
+[![GitHub issues](https://img.shields.io/github/issues/miesmile/Unify-Sign?style=flat-square)](https://github.com/miesmile/Unify-Sign/issues)
 
 # 聚合签到 (Unify-Sign)
 
@@ -312,7 +311,7 @@ signRunner.setName('测试我的应用签到').exec();
     * 长截图AutoJS软件中的日志，可以的话再附上日志文件 (`logs/log-verboses.log`)。日志默认保存 100k，旧日志在 `logs/logback`。
     * 如有截图或录屏更有助于定位问题。
 4. **提交**:
-    * **[创建 ISSUE](https://github.com/TonyJiangWJ/Unify-Sign/issues/new)** (推荐)。
+    * **[创建 ISSUE](https://github.com/miesmile/Unify-Sign/issues/new)** (推荐)。
     * **[前往论坛反馈](https://autoscripts.flarum.cloud)** 邮箱注册即可，常见的问题后续会逐渐完善上去
     * 如果日志包含隐私信息，可删除敏感部分或通过邮件发送给开发者: `tonyjiangwj@gmail.com`。
 
