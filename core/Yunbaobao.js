@@ -238,96 +238,18 @@ function SignRunner () {
   }
 
   /**
-   * 打开云宝宝，包名启动失败时尝试按应用名启动
-   */
-  /**
-   * 真正关闭云宝宝（最小化只是回桌面，进程与界面还在，重开只会恢复上次的残留页面）
-   * 依次尝试：root 下 am force-stop → 应用信息页「强行停止」→ 最近任务上滑清卡片 → 兜底最小化
-   * @returns {boolean} 是否已关闭（兜底最小化返回 false）
+   * 真正关闭云宝宝：跳转「应用信息」页 → 点「结束运行 / 强行停止」→ 确定 → 返回
+   * （最小化只是回桌面，进程与界面还在，重开只会恢复上次残留的页面）
+   * @returns {boolean} 是否点了关闭按钮
    */
   this.closeYunbaobaoApp = function () {
-    // 注意：这里不判断「是否在前台」——脚本很可能是从桌面/其它应用启动的，
-    // 此时云宝宝在后台但进程仍在，直接 launchPackage 只会恢复上次残留的界面（广告页/内页）
-    // ① shell am force-stop（最快，不需要切页面；需要 root 或 Shizuku/shell 权限）
-    if (this.forceStopByShell()) {
-      return true
-    }
-    // ② 系统「应用信息」页点「强行停止」
-    if (this.forceStopByAppSettings()) {
-      return true
-    }
-    // ③ 最近任务里上滑清掉云宝宝卡片
-    if (this.killByRecents()) {
-      return true
-    }
-    // ④ 兜底：最小化（至少回到桌面，避免在残留页面上继续操作）
-    this.pushWarningLog('未能真正关闭云宝宝进程，退化为最小化（重启后可能仍是上次界面）')
-    try {
-      commonFunctions.minimize()
-    } catch (e) {
-      // 忽略
-    }
-    return false
+    return this.forceStopByAppSettings()
   }
 
   /**
-   * 用 shell 的 am force-stop 关闭云宝宝
-   * 先试普通 shell（已授权 shell / 装了 Shizuku 时可用），有 root 再试 root shell
-   * @returns {boolean} 是否已下发关闭命令
-   */
-  this.forceStopByShell = function () {
-    let wasForeground = false
-    try {
-      wasForeground = commonFunctions.myCurrentPackage() == _package_name
-    } catch (e) {
-      // 忽略
-    }
-    // 前台时可以直接验证效果：force-stop 成功会让前台包变成桌面/上一个应用
-    let verifyIfForeground = function (that) {
-      if (!wasForeground) {
-        return true
-      }
-      try {
-        if (commonFunctions.myCurrentPackage() == _package_name) {
-          that.pushWarningLog('am force-stop 已下发，但云宝宝仍在前台，判定未生效')
-          return false
-        }
-      } catch (e) {
-        // 忽略
-      }
-      return true
-    }
-    try {
-      shell('am force-stop ' + _package_name)
-      sleep(900)
-      if (!verifyIfForeground(this)) {
-        return false
-      }
-      this.pushLog('已通过 am force-stop 关闭云宝宝')
-      return true
-    } catch (e) {
-      logUtils.debugInfo(['普通 shell 执行 force-stop 失败：{}', e])
-    }
-    let hasRoot = files.exists('/system/bin/su') || files.exists('/system/xbin/su') || files.exists('/sbin/su')
-    if (hasRoot) {
-      try {
-        shell('am force-stop ' + _package_name, true)
-        sleep(900)
-        if (!verifyIfForeground(this)) {
-          return false
-        }
-        this.pushLog('已通过 root am force-stop 关闭云宝宝')
-        return true
-      } catch (e) {
-        logUtils.debugInfo(['root shell 执行 force-stop 失败：{}', e])
-      }
-    }
-    return false
-  }
-
-  /**
-   * 通过系统「应用信息」页点击「强行停止」关闭云宝宝
-   * @returns {boolean} 是否执行了关闭动作
+   * 通过系统「应用信息」页点击「结束运行 / 强行停止」关闭云宝宝（无 root 可用）
+   * 流程：打开应用详情页 → 循环查找按钮 → 点击 → 循环查找「确定」确认 → 返回桌面
+   * @returns {boolean} 是否点了关闭按钮
    */
   this.forceStopByAppSettings = function () {
     let backSafely = function () {
@@ -337,33 +259,50 @@ function SignRunner () {
         // 忽略
       }
     }
-    let clicked = false
     try {
-      this.pushLog('尝试通过应用信息页关闭云宝宝')
+      this.pushLog('打开云宝宝应用信息页，准备强制停止')
       app.openAppSetting(_package_name)
-      sleep(2200)
-      let pattern = /(强行停止|强制停止|结束运行|停止运行|强制结束|Force stop|Force Stop)/
+      sleep(1500)
+      let buttonNames = ['结束运行', '强行停止', '强制停止', '停止运行']
       let btn = null
-      // 按钮可能不在首屏，最多向下滚 3 次再找
-      for (let i = 0; i < 3 && !btn; i++) {
-        btn = textMatches(pattern).findOnce() || descMatches(pattern).findOnce()
-        if (btn) {
-          break
+      let findBtn = function () {
+        for (let i = 0; i < buttonNames.length; i++) {
+          if (text(buttonNames[i]).exists()) {
+            return text(buttonNames[i]).findOnce()
+          }
         }
+        return null
+      }
+      // 首屏查找（最多 5 秒）
+      let start = new Date().getTime()
+      while (!btn && new Date().getTime() - start < 5000) {
+        btn = findBtn()
+        if (!btn) {
+          sleep(300)
+        }
+      }
+      // 首屏没有就滚动一屏再找（有的机型按钮在页面下方）
+      if (!btn) {
         let sv = scrollable().findOnce()
         if (sv) {
           sv.scrollForward()
         }
-        sleep(900)
+        sleep(800)
+        start = new Date().getTime()
+        while (!btn && new Date().getTime() - start < 5000) {
+          btn = findBtn()
+          if (!btn) {
+            sleep(300)
+          }
+        }
       }
       if (!btn) {
-        this.pushWarningLog('应用信息页未找到「强行停止」按钮')
+        this.pushWarningLog('应用信息页未找到「结束运行/强行停止」按钮')
         this.logVisibleTexts('应用信息页')
         backSafely()
         return false
       }
-      clicked = true
-      this.pushLog('应用信息页找到「' + btn.text() + '」，点击')
+      this.pushLog('点击「' + btn.text() + '」')
       if (btn.clickable()) {
         btn.click()
       } else {
@@ -374,25 +313,44 @@ function SignRunner () {
           btn.click()
         }
       }
-      sleep(1300)
-      // 二次确认弹窗：确定 / 强行停止 / 停止
-      let confirm = textMatches(/^(确定|强行停止|停止|OK)$/).findOnce()
-      if (!confirm) {
-        confirm = textMatches(/(确定|强行停止|停止)/).findOnce()
+      sleep(800)
+      // 处理确认弹窗（最多等 5 秒）
+      let confirmNames = ['确定', '强行停止', '确定停止', '停止']
+      let confirm = null
+      start = new Date().getTime()
+      while (!confirm && new Date().getTime() - start < 5000) {
+        for (let i = 0; i < confirmNames.length; i++) {
+          if (text(confirmNames[i]).exists()) {
+            confirm = text(confirmNames[i]).findOnce()
+            break
+          }
+        }
+        if (!confirm) {
+          sleep(300)
+        }
       }
       if (confirm) {
-        this.pushLog('点击「强行停止」二次确认：' + confirm.text())
-        confirm.click()
-        sleep(1000)
+        this.pushLog('确认弹窗点击「' + confirm.text() + '」')
+        if (confirm.clickable()) {
+          confirm.click()
+        } else {
+          let parent = confirm.parent()
+          if (parent) {
+            parent.click()
+          } else {
+            confirm.click()
+          }
+        }
+        sleep(800)
       }
-      this.pushLog('已在应用信息页执行「强行停止」')
+      this.pushLog('已执行「' + btn.text() + '」关闭云宝宝')
       backSafely()
       sleep(700)
       return true
     } catch (e) {
       this.pushWarningLog('应用信息页关闭云宝宝异常：' + e)
       backSafely()
-      return clicked
+      return false
     }
   }
 
@@ -420,71 +378,13 @@ function SignRunner () {
     }
   }
 
-  /**
-   * 通过最近任务上滑清掉云宝宝卡片（无 root 时的通用关闭方式）
-   * @returns {boolean} 是否执行了清理动作
-   */
-  this.killByRecents = function () {
-    let backSafely = function () {
-      try {
-        automator.back()
-      } catch (e) {
-        // 忽略
-      }
-    }
-    try {
-      this.pushLog('尝试通过最近任务关闭云宝宝')
-      recents()
-      sleep(1500)
-      let card = textContains(_app_name).findOnce() || descContains(_app_name).findOnce()
-      if (card) {
-        let b = card.bounds()
-        if (b) {
-          this.pushLog('最近任务找到云宝宝卡片，上滑关闭')
-          automator.swipe(b.centerX(), b.centerY(), b.centerX(),
-            Math.max(1, b.centerY() - Math.round(config.device_height * 0.25)), 350)
-        } else {
-          this.pushWarningLog('云宝宝卡片无 bounds，改用屏幕中部上滑')
-          automator.swipe(Math.round(config.device_width / 2), Math.round(config.device_height * 0.5),
-            Math.round(config.device_width / 2), Math.round(config.device_height * 0.05), 350)
-        }
-      } else {
-        // 最近任务里卡片可能不暴露文本（被系统渲染成纯图），对中间最上面的卡片上滑
-        this.pushWarningLog('最近任务未找到云宝宝卡片文本，改为对中间卡片上滑')
-        automator.swipe(Math.round(config.device_width / 2), Math.round(config.device_height * 0.5),
-          Math.round(config.device_width / 2), Math.round(config.device_height * 0.05), 350)
-      }
-      sleep(1200)
-      backSafely()
-      sleep(600)
-      this.pushLog('已在最近任务中执行上滑关闭云宝宝')
-      return true
-    } catch (e) {
-      this.pushWarningLog('最近任务关闭云宝宝异常：' + e)
-      backSafely()
-      return false
-    }
-  }
-
   this.openYunbaobao = function () {
-    this.pushLog('打开云宝宝（先真正关闭进程，再冷启动）')
-    // 关键：无条件先关闭。脚本大概率是从桌面/其它应用启动的，此时云宝宝在后台但进程还在，
-    // 之前只在「当前是云宝宝」时才关闭，导致 launchPackage 直接恢复上次残留的界面
+    this.pushLog('打开云宝宝（先关闭进程，再启动）')
+    // 无条件先关闭：脚本多半是从桌面启动的，此时云宝宝在后台但进程还在，
+    // 不先停掉的话 launchPackage 只会把上次的残留界面（广告页/内页）拉回前台
     this.closeYunbaobaoApp()
     sleep(1000)
-    if (this.launchYunbaobaoAndWaitHome()) {
-      return true
-    }
-    // 没进主页 = 关闭没生效、启动后仍是上次残留页面：改用系统「应用信息」页强行停止再重启一次
-    this.pushWarningLog('启动后未进入云宝宝主页（疑似没真正关闭），改用应用信息页强制停止后重试')
-    if (this.forceStopByAppSettings()) {
-      sleep(1000)
-      if (this.launchYunbaobaoAndWaitHome()) {
-        return true
-      }
-    }
-    this.pushWarningLog('云宝宝重启失败，界面可能仍是上次残留页面')
-    return false
+    return this.launchYunbaobaoAndWaitHome()
   }
 
   /**
