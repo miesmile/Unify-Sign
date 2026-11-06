@@ -14,6 +14,9 @@ module.exports = function (default_config, config, CONFIG_STORAGE_NAME) {
     'fishpond_close_continuous_sign', 'fishpond_close', 'sign_and_get_points'
   ])
 
+  // 云宝宝识图配置（广告关闭叉等）
+  binder.bindCustomSignConfig('yunbaobao', {}, ['ad_close'])
+
   // 微博
   binder.bindCustomSignConfig('weibo', {}, ['sign_btn', 'mine_btn', 'mine_checked_btn', 'signed_icon'])
 

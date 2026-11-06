@@ -128,7 +128,7 @@ const QuestionAnswer = {
   },
   methods: {
     doQuery: function () {
-      return API.get('https://api.github.com/repos/TonyJiangWJ/Unify-Sign/issues?labels=documentation').then(resp => {
+      return API.get('https://api.github.com/repos/miesmile/Unify-Sign/issues?labels=documentation').then(resp => {
         this.queryResult = resp
         this.contentFrom = 'Github'
         return Promise.resolve(true)
@@ -144,7 +144,7 @@ const QuestionAnswer = {
       })
     },
     doGetAdbUseDoc: function () {
-      API.get('https://api.github.com/repos/TonyJiangWJ/AutoScriptBase/contents/resources/doc/ADB%E6%8E%88%E6%9D%83%E8%84%9A%E6%9C%AC%E8%87%AA%E5%8A%A8%E5%BC%80%E5%90%AF%E6%97%A0%E9%9A%9C%E7%A2%8D%E6%9D%83%E9%99%90.md?ref=master')
+      API.get('https://api.github.com/repos/miesmile/AutoScriptBase/contents/resources/doc/ADB%E6%8E%88%E6%9D%83%E8%84%9A%E6%9C%AC%E8%87%AA%E5%8A%A8%E5%BC%80%E5%90%AF%E6%97%A0%E9%9A%9C%E7%A2%8D%E6%9D%83%E9%99%90.md?ref=master')
       .then(resp => {
         this.adbUseDoc.title = 'ADB授权脚本自动开启无障碍权限'
         this.adbUseDoc.content = Base64.decode(resp.content)
@@ -200,14 +200,14 @@ const Readme = {
     markdownContent: function () {
       let content = Base64.decode(this.base64Content)
       // console.log(content)
-      content = content.replace(/\(\.([^\)]+)\)/g, '(https://github.com/TonyJiangWJ/Unify-Sign/raw/master$1)')
+      content = content.replace(/\(\.([^\)]+)\)/g, '(https://github.com/miesmile/Unify-Sign/raw/master$1)')
       // console.log(content)
       return content
     }
   },
   methods: {
     getReadme: function () {
-      API.get(`https://api.github.com/repos/TonyJiangWJ/Unify-Sign/contents/README.md?ref=master`)
+      API.get(`https://api.github.com/repos/miesmile/Unify-Sign/contents/README.md?ref=master`)
       .then(resp => {
         this.noAccessPerm = false
         this.base64Content = resp.content
@@ -254,7 +254,7 @@ const HistoryRelease = {
   data () {
     return {
       loading: false,
-      releasesUrl: 'https://api.github.com/repos/TonyJiangWJ/Unify-Sign/releases',
+      releasesUrl: 'https://api.github.com/repos/miesmile/Unify-Sign/releases',
       historyReleases: []
     }
   },

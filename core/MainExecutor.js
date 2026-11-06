@@ -9,6 +9,7 @@ let logUtils = singletonRequire('LogUtils')
 let logFloaty = singletonRequire('LogFloaty')
 let NotificationHelper = singletonRequire('Notification')
 let formatDate = require('../lib/DateUtil.js')
+let requestScreenCaptureHelper = require('../lib/prototype/RequestScreenCapture.js')
 
 function MainExecutor () {
 
@@ -58,8 +59,13 @@ function MainExecutor () {
             NotificationHelper.createNotification('有任务执行超时，五分钟后再试', '失败任务名称：' + target.name, 'taskTimeout')
             exit()
           })
-          if (!require('./' + target.script).setName(target.name).setTaskCode(target.taskCode).setSubTasks(target.subTasks).executeIfNeeded()) {
-            failedList.push(target.name)
+          // 自动处理系统「录制或共享屏幕」授权弹窗（若有），避免弹窗阻塞当前脚本
+          try {
+            requestScreenCaptureHelper.handleScreenShareDialogIfNeeded()
+          } catch (e) {
+            logUtils.debugInfo(['处理截图授权弹窗异常：{}', e])
+          }
+          if (!require('./' + target.script).setName(target.name).setTaskCode(target.taskCode).setSubTasks(target.subTasks).executeIfNeeded()) {            failedList.push(target.name)
             restart = true
           }
           done = true

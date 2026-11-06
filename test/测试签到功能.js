@@ -28,6 +28,8 @@ config.is_test = true
 // let signRunner = require('../core/JingDongBeans.js')
 // let signRunner = require('../core/BBFarm.js')
 // let signRunner = require('../core/XiaomiShop.js')
-let signRunner = require('../core/Eleme.js')
-signRunner.setName('签到测试').exec()
+// let signRunner = require('../core/Eleme.js')
+let signRunner = require('../core/Yunbaobao.js')
+// setTest：测试模式下不受「今日已执行」记录限制，可反复调试
+signRunner.setName('签到测试').setTest().exec()
 runningQueueDispatcher.removeRunningTask()

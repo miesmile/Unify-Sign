@@ -67,7 +67,7 @@ let commonDefaultConfig = {
   buddha_like_mode: false,
   // 是否自动允许截图权限
   request_capture_permission: true,
-  // 自动允许时，查找的按钮控件文本
+  // 自动允许时，查找的按钮控件文本（新系统弹窗的 开始/继续 已内置兼容，可留空）
   capture_permission_button: 'START NOW|立即开始|允许',
   // 是否保存日志文件，如果设置为保存，则日志文件会按时间分片备份在logback/文件夹下
   save_log_file: true,

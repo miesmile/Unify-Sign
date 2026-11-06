@@ -24,6 +24,34 @@ let default_config = {
   notificationChannel: '聚合签到通知',
   supported_signs: [
     {
+      name: '云宝宝看广告',
+      taskCode: 'Yunbaobao',
+      script: 'Yunbaobao.js',
+      enabled: true,
+      subTasks: [
+        {
+          taskCode: 'giftPackage',
+          taskName: '惊喜礼包',
+          enabled: true
+        },
+        {
+          taskCode: 'dailyCheckIn',
+          taskName: '每日打卡',
+          enabled: true
+        },
+        {
+          taskCode: 'dailyWatchVideo',
+          taskName: '每日看视频10次',
+          enabled: true
+        },
+        {
+          taskCode: 'openBox',
+          taskName: '开宝箱赚云币',
+          enabled: true
+        }
+      ]
+    },
+    {
       name: '蚂蚁积分签到',
       taskCode: 'AntCredits',
       script: 'AntCredits.js',
