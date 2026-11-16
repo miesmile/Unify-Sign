@@ -256,14 +256,21 @@ function SignRunner () {
     this._restarting = false
     // 单次执行内最多重启 2 次：页面异常时每轮都强停重开会让整个脚本十几分钟出不来
     this._restartTimes = 0
+    // 启动失败后「强停再拉起」只做一次，避免失败-重启-再失败的死循环
+    this._relaunching = false
     // 关闭叉识图失败时间戳：同一屏连续调用时避免重复做整轮匹配
     this._closeTplMissAt = 0
     // 是否追奖励弹窗下方的「观看视频后开启」（默认追，只有惊喜礼包/开宝箱这类连看入口需要）
     this._allowChainNextAd = true
     this.pushLog('===== 云宝宝看广告开始 =====')
     if (!this.openYunbaobao()) {
-      this.pushErrorLog('打开云宝宝失败，终止本次执行')
-      return
+      // 启动失败是致命错误：内部已做过「强停 + 重启」，这里再给一次整体重试机会
+      this.pushWarningLog('首次打开云宝宝失败（进入失败），再重启一次')
+      sleep(2000)
+      if (!this.openYunbaobao()) {
+        this.pushErrorLog('打开云宝宝失败，终止本次执行')
+        return
+      }
     }
     this.skipDialogIfPresent()
     sleep(1000)
@@ -555,15 +562,13 @@ function SignRunner () {
   }
 
   /**
-   * 启动 / 唤回云宝宝：四种手段逐级降级，每步都校验包名，全部 try/catch 包裹。
-   * 之前只有 commonFunctions.launchPackage + app.launchApp，冷启动（刚强制停止后）经常失败，
-   * 且 app.launchApp 按名称启动会阻塞/抛异常，把整个脚本一起打死。
-   * @param {String} purpose 用途（日志用）
+   * 尝试用多种手段把云宝宝拉到前台（不做重启），每步校验包名
+   * 注意：不用 app.launchApp（按应用名启动会阻塞/抛异常，把整个脚本一起打死），改用 MAIN/LAUNCHER intent
    * @returns {boolean} 是否确认已在前台
    */
-  this.launchYunbaobaoPackage = function (purpose) {
+  this.tryLaunchYunbaobao = function (purpose) {
     let ptag = purpose ? '（' + purpose + '）' : ''
-    let names = ['框架launchPackage', 'app.launchPackage', '按应用名launchApp', 'MAIN/LAUNCHER intent']
+    let names = ['框架launchPackage', 'app.launchPackage', 'MAIN/LAUNCHER intent']
     let tries = [
       function () {
         commonFunctions.launchPackage(_package_name)
@@ -572,9 +577,6 @@ function SignRunner () {
         if (typeof app.launchPackage === 'function') {
           app.launchPackage(_package_name)
         }
-      },
-      function () {
-        app.launchApp(_app_name)
       },
       function () {
         app.startActivity({
@@ -602,6 +604,42 @@ function SignRunner () {
       this.pushWarningLog('启动后仍未进入云宝宝' + ptag + '（' + names[i] + '），尝试下一种方式')
     }
     return false
+  }
+
+  /**
+   * 启动 / 唤回云宝宝：先正常拉起（三种手段逐级降级），
+   * 全部失败（典型日志「进入[com.babystar.enhanced] 失败」）时直接重启应用——强制停止进程后再拉起，
+   * 只在单次执行里做一次，避免失败-重启-再失败的死循环
+   * @param {String} purpose 用途（日志用）
+   * @returns {boolean} 是否确认已在前台
+   */
+  this.launchYunbaobaoPackage = function (purpose) {
+    let ptag = purpose ? '（' + purpose + '）' : ''
+    if (this.tryLaunchYunbaobao(purpose)) {
+      return true
+    }
+    if (this._relaunching || this.isTimeout()) {
+      return false
+    }
+    // 启动失败说明进程多半卡死或界面异常，留在当前页面继续操作只会一路错下去
+    this._relaunching = true
+    this.pushWarningLog('启动云宝宝失败' + ptag + '，直接重启云宝宝（强制停止后重新打开）')
+    try {
+      this.closeYunbaobaoApp()
+      sleep(1200)
+      let retry = this.tryLaunchYunbaobao('重启后')
+      if (retry) {
+        this.pushLog('重启云宝宝成功')
+      } else {
+        this.pushWarningLog('重启云宝宝仍失败（当前包：' + commonFunctions.myCurrentPackage() + '）')
+      }
+      return retry
+    } catch (e) {
+      this.pushWarningLog('重启云宝宝异常：' + e)
+      return false
+    } finally {
+      this._relaunching = false
+    }
   }
 
   this.openYunbaobao = function () {
