@@ -1665,6 +1665,7 @@ function SignRunner () {
         break
       }
       // 判断是否已看完（方式2）：点击后约1秒出现「任务已完成」，显示约2秒后消失
+      // 单位是毫秒：2500ms，提示只闪 2 秒，监测 2.5 秒足够
       if (this.checkTaskCompletedHint(2500)) {
         this.pushLog('每日看视频任务已完成（点击后出现「任务已完成」提示）')
         finished = true
@@ -3993,12 +3994,26 @@ function SignRunner () {
 
   /**
    * 检测点击「进行中」后短暂出现的「任务已完成」提示（约1秒后出现、约2秒后消失）
-   * @param {Number} seconds 监测时长（秒）
+   * @param {Number} waitMs 监测时长（毫秒，默认 2500）
    * @returns {boolean} 是否出现
    */
-  this.checkTaskCompletedHint = function (seconds) {
+  this.checkTaskCompletedHint = function (waitMs) {
+    waitMs = typeof waitMs === 'number' && waitMs > 0 ? waitMs : 2500
+    // 兼容按秒传参（如 2.5 秒）
+    if (waitMs < 100) {
+      waitMs = waitMs * 1000
+    }
+    // 防守：误传成「秒」（如 2500 被当成 2500 秒 = 41 分钟）时压到 20 秒，
+    // 这个提示最多出现 2 秒，等更久没有意义，反而会把整个任务卡死
+    if (waitMs > 20000) {
+      logUtils.debugInfo(['checkTaskCompletedHint 参数过大（{}），已按 20000ms 处理', waitMs])
+      waitMs = 20000
+    }
     let start = new Date().getTime()
-    while (new Date().getTime() - start < seconds * 1000) {
+    while (new Date().getTime() - start < waitMs) {
+      if (this.isTimeout()) {
+        return false
+      }
       if (widgetUtils.widgetGetOne('任务已完成|任务完成|今日已完成', 400, false, true)) {
         this.pushLog('检测到「任务已完成」提示')
         return true
