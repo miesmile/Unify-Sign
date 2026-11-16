@@ -2242,6 +2242,9 @@ function SignRunner () {
     let jumpCase = matchJumpAdCase(content)
     let noWait = !!(jumpCase && jumpCase.noWait)
     let inStore = false
+    // 跳转目标可能是下载页：记录本广告是否已中断下载，避免每 2 秒重复点
+    this._downloadStopped = false
+    this._downloadChecks = 0
     if (noWait) {
       this.pushLog('该广告为「点击即可领取」类，跳转后直接返回，不等待倒计时')
       sleep(2500)
@@ -2271,6 +2274,17 @@ function SignRunner () {
         // 每2秒复查一次「禁止/仅打开一次」弹窗 + 识别微信类广告 + 标记应用商店
         if (++loopCount % 2 == 0) {
           this.confirmJumpDialogIfNeeded(true)
+          // 跳转目标可能是下载页面：识别到「下载中 / **%」立即点该文本中断下载
+          // （百分比只在状态栏以下才算进度，避免把顶部电量当成下载进度）
+          // 只查前几次，避免每 2 秒都做一次查找把等待时间拖长
+          if (!this._downloadStopped && this._downloadChecks < 5) {
+            this._downloadChecks++
+            if (this.stopDownloadIfPresent('跳转广告')) {
+              this._downloadStopped = true
+              // 归为下载类广告：等待结束后走「取消下载 → 返回云宝宝 → 关闭广告」
+              inStore = true
+            }
+          }
           if (this.isWechatForeground()) {
             this.pushLog('等待期间识别到微信（小程序/小游戏类广告）')
             this.handleWechatAd()
@@ -3453,10 +3467,114 @@ function SignRunner () {
   }
 
   /**
+   * 查找「下载中 / 百分比」这类下载进度文本（点击它即可中断下载）
+   * 百分比必须落在状态栏以下、屏幕底部以上的正文区域，
+   * 否则会把顶部电池电量（85%）误当成下载进度，点一下反而切到系统界面
+   * @returns {Object|null} 可点击的控件
+   */
+  this.findDownloadingText = function () {
+    let screenH = 0
+    try {
+      screenH = device.height || 0
+    } catch (e) {
+      screenH = 0
+    }
+    screenH = screenH || 2000
+    // 状态栏高度一般 5% 左右，底部导航栏同样排除
+    let minY = Math.max(60, Math.round(screenH * 0.055))
+    let maxY = Math.round(screenH * 0.93)
+    let inBody = function (w) {
+      try {
+        let b = w.bounds()
+        if (!b) {
+          return false
+        }
+        let cy = b.centerY()
+        return cy >= minY && cy <= maxY && b.width() > 0 && b.height() > 0
+      } catch (e) {
+        return false
+      }
+    }
+    // 1) 明确写着「下载中 / 正在下载」的文字：最可靠，直接点它
+    let nameRegex = '(下载中|正在下载|下载任务|下载安装中)'
+    let byName = null
+    try {
+      byName = widgetUtils.widgetGetOne(nameRegex, 400, false, true)
+    } catch (e) {
+      byName = null
+    }
+    if (byName && inBody(byName)) {
+      return byName
+    }
+    // 2) 百分比文本（如「35%」「35 %. {0,8}」）
+    let pctRegex = '^(\\d{1,3}(.\\d+)?\\s*%|\\d{1,3}\\s*%.{0,8})$'
+    let byPct = null
+    try {
+      byPct = selector().textMatches(pctRegex).findOne(300)
+    } catch (e) {
+      byPct = null
+    }
+    if (byPct && inBody(byPct)) {
+      return byPct
+    }
+    // 3) 兜底：遍历所有百分比控件，取第一个落在正文区域的（跳过顶部电量）
+    try {
+      let list = selector().textMatches(pctRegex).find()
+      if (list && list.length) {
+        for (let i = 0; i < list.length; i++) {
+          if (inBody(list[i])) {
+            return list[i]
+          }
+        }
+      }
+    } catch (e) {
+      logUtils.debugInfo(['遍历百分比控件异常：{}', e])
+    }
+    return null
+  }
+
+  /**
+   * 中断下载：识别到「下载中 / **%」后立即点击该文本停止下载（最多点 3 次，点一次复查一次）
+   * @param {String} tag 日志前缀
+   * @returns {Boolean} 是否点到了下载进度文本
+   */
+  this.stopDownloadIfPresent = function (tag) {
+    tag = tag || ''
+    let stopped = false
+    for (let i = 0; i < 3; i++) {
+      let target = this.findDownloadingText()
+      if (!target) {
+        break
+      }
+      let txt = ''
+      try {
+        txt = (target.text && target.text()) || ''
+      } catch (e) {
+        txt = ''
+      }
+      this.pushLog((tag ? '[' + tag + '] ' : '') + '检测到下载进度「' + txt + '」，点击文本停止下载')
+      try {
+        automator.clickCenter(target)
+      } catch (e) {
+        logUtils.debugInfo(['点击下载进度文本异常：{}', e])
+        break
+      }
+      stopped = true
+      sleep(1200)
+    }
+    if (stopped) {
+      this.pushLog((tag ? '[' + tag + '] ' : '') + '已点击下载进度文本，下载已中断')
+    }
+    return stopped
+  }
+
+  /**
    * 下载类广告：取消下载并返回云宝宝，直接关闭广告（挽留弹窗点「关闭广告」）
    */
   this.cancelDownloadAndClose = function () {
     this.pushLog('取消下载并返回云宝宝')
+    // 先点「下载中/**%」文本把下载停掉，再退出页面（否则退出后仍在后台下载）
+    this.stopDownloadIfPresent('取消下载')
     // 返回键退出应用商店/取消下载（最多3次，回到云宝宝即停）
     for (let i = 0; i < 3; i++) {
       if (commonFunctions.myCurrentPackage() == _package_name) {
