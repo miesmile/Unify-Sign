@@ -45,8 +45,8 @@ function MainExecutor () {
         try {
           // 增加一个额外线程计时器，如果任务超时，直接跳过或者终止执行
           let signWatcher = threads.start(function () {
-            // 单任务执行超时15分钟（云宝宝这类要连续看十几条广告的任务，10 分钟会在收尾阶段被强杀）
-            let timeout = 15*60
+            // 单任务执行超时30分钟（云宝宝这类要连续看十几条广告的任务，10 分钟会在收尾阶段被强杀）
+            let timeout = 30*60
             while (!done && timeout-- > 0) {
               sleep(1000)
             }
