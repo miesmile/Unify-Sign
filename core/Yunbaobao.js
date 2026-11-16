@@ -238,8 +238,9 @@ function SignRunner () {
 
   // 单广告最大等待秒数，避免异常广告卡死
   const MAX_AD_SECONDS = 120
-  // 单次任务总超时（MainExecutor 单任务超时10分钟，这里留出余量）
-  const MAX_TOTAL_SECONDS = 8.5 * 60
+  // 单次任务总超时：MainExecutor 看门狗是 15 分钟，这里 10 分钟自我收尾，
+  // 留 5 分钟余量给最后一条广告的等待（单条最长 120 秒）+ 返回清理，避免被看门狗 exit() 强杀（那就是"中途退出"）
+  const MAX_TOTAL_SECONDS = 10 * 60
 
   this.startTime = null
 
@@ -262,25 +263,31 @@ function SignRunner () {
     this._closeTplMissAt = 0
     // 是否追奖励弹窗下方的「观看视频后开启」（默认追，只有惊喜礼包/开宝箱这类连看入口需要）
     this._allowChainNextAd = true
-    this.pushLog('===== 云宝宝看广告开始 =====')
+    // 整个执行体兜底：任何未捕获异常都不允许把脚本打死（表现就是"中途退出"），
+    // 记录日志后照常收尾，框架就不会把这次当成脚本崩溃
+    try {
+      this.pushLog('===== 云宝宝看广告开始 =====')
     if (!this.openYunbaobao()) {
       // 启动失败是致命错误：内部已做过「强停 + 重启」，这里再给一次整体重试机会
       this.pushWarningLog('首次打开云宝宝失败（进入失败），再重启一次')
       sleep(2000)
       if (!this.openYunbaobao()) {
-        this.pushErrorLog('打开云宝宝失败，终止本次执行')
-        return
+        this.pushErrorLog('打开云宝宝失败，仍继续执行后续流程（不在中途退出）')
       }
     }
     this.skipDialogIfPresent()
     sleep(1000)
-    // 进入赚云币页面（失败则终止，避免在错误页面空找）
+    // 进入赚云币页面：失败也不终止。子任务内部各有 ensureCoinPage 会重试，
+    // 直接 return 会让整轮白跑，用户看到的就是"脚本中途退出"
     if (!this.enterCoinPage()) {
-      this.pushErrorLog('未能进入赚云币页，终止本次执行')
-      return
+      this.pushWarningLog('未能进入赚云币页，继续由各子任务自行重试')
     }
     // 第一次进入赚云币页会弹「签到成功」，下方「额外领取云币」点一次可看广告，看完回点「我知道了」
-    this.handleSignSuccessBonusDialog()
+    try {
+      this.handleSignSuccessBonusDialog()
+    } catch (e) {
+      this.pushWarningLog('签到成功弹窗处理异常：' + e)
+    }
     // 依次执行各广告任务（测试界面可通过 onlySubTask 指定只跑某个子任务，日常执行时为空=全部执行）
     // 每个子任务单独 try/catch：单个任务异常不再把整个脚本打死（异常终止后框架会当成脚本崩溃）
     let self = this
@@ -312,7 +319,21 @@ function SignRunner () {
     } else {
       this.pushWarningLog('存在未完成的子任务，稍后由框架自动重试')
     }
-    commonFunctions.minimize(_package_name)
+    try {
+      commonFunctions.minimize(_package_name)
+    } catch (e) {
+      logUtils.debugInfo(['最小化云宝宝异常：{}', e])
+    }
+    } catch (e) {
+      // 兜底：记录后正常结束，绝不让异常冒泡（框架 catch 到会判成脚本失败并强制结束）
+      this.pushErrorLog('云宝宝执行异常，已捕获并正常结束：' + e)
+      logUtils.errorInfo(['云宝宝执行异常：{}', e])
+      try {
+        commonFunctions.minimize(_package_name)
+      } catch (e2) {
+        // 忽略
+      }
+    }
   }
 
   this.allSubTasksDone = function () {
