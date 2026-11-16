@@ -46,9 +46,9 @@ const JUMP_AD_CASES = [
   { regex: /打开.{0,4}(领奖励|领取奖励)/, desc: '打开XX领奖励' },
   { regex: /前往.{0,4}(领奖励|领取奖励)/, desc: '前往XX领奖励' },
   { regex: /去.{0,10}(拿奖励|领取奖励|领奖励)/, desc: '去XX拿奖励' },
-  { regex: /点击打开或下载第三方应用/, desc: '点击打开或下载第三方应用' },
-  { regex: /打开或下载第三方应用/, desc: '打开或下载第三方应用' },
-  { regex: /下载第三方应用/, desc: '下载第三方应用' },
+  // 「点击打开或下载第三方应用」的几种写法合并成一条（原来三条重复）
+  { regex: /(点击)?(打开|下载).{0,6}第三方应用/, desc: '点击打开或下载第三方应用' },
+  { regex: /立即体验|马上体验|立即试玩/, desc: '立即体验' },
   { regex: /(去体验|体验|试玩|去玩).{0,10}\d+\s*(秒|s)/, desc: '去体验N秒（必须跳转）' },
   // 「点击广告，即可获得奖励」类：点一下跳转就算完成，跳转后可以直接返回，不用等倒计时（noWait）
   { regex: /点击(该|此)?广告.{0,10}(即可|就能|便能|马上).{0,6}(获得|领取|得).{0,4}(奖励|云币)/, desc: '点击广告即可获得奖励（可直接返回）', noWait: true },
@@ -1623,7 +1623,6 @@ function SignRunner () {
     }
     let maxWatch = 10
     let watched = 0
-    let notOpened = 0
     let finished = false
     // 判断是否已看完（方式1）：识别「每日看视频10次(N/10)」里的次数，已到 10 直接结束
     let done = this.readDailyWatchProgress()
@@ -1653,22 +1652,10 @@ function SignRunner () {
         finished = true
         break
       }
-      // 关键：先确认广告真的打开了。点了没反应时若直接进 watchAd，
-      // 会在空页面上做完整轮识别（等广告页 + 识图 + 返回），一次白等一两分钟，
-      // 看起来就是「卡在每日看视频第一次，一直不往下走」
-      if (!this.waitAdOpened(6)) {
-        notOpened++
-        this.pushWarningLog('点击「进行中」后没有检测到广告页（第' + notOpened + '次）')
-        if (this.isOnCoinPage() && notOpened >= 2) {
-          this.pushWarningLog('连续' + notOpened + '次点击都没打开广告，可能今日次数已用完或入口失效，结束每日看视频')
-          break
-        }
-        continue
-      }
-      notOpened = 0
+      // 点击「进行中」后的流程与点「观看视频后开启」完全一致：
+      // 区别只是这里没有弹窗、直接进广告页，所以不再单独探测「广告是否打开」，
+      // 交给 watchAd 内部的 3 秒等待 + 广告页识别处理
       watched++
-      // 每日看视频是「点一次 = 看一条」，不允许在奖励弹窗里接着看下一条，
-      // 否则一条广告能连着看十几分钟，外层看不到进度
       this.watchAd('每日看视频', { allowChainNextAd: false, skipBetweenWait: true })
       // 看完后回到赚云币页，准备下一次（残留广告先关闭再回）
       if (!this.ensureCoinPage('每日看视频-回页')) {
@@ -1688,37 +1675,6 @@ function SignRunner () {
       return true
     }
     this.pushWarningLog('每日看视频未执行到任何一次，不标记完成')
-    return false
-  }
-
-  /**
-   * 点击广告入口后确认广告是否真的打开
-   * 「已打开」判定：已跳到其它应用 / 出现倒计时·跳过·关闭等广告元素 / 已离开赚云币页
-   * 只用轻量控件判定（不做 OCR），最多等 waitSeconds 秒，避免看视频这类任务白等
-   * @param {Number} waitSeconds 最长等待秒数
-   * @returns {Boolean}
-   */
-  this.waitAdOpened = function (waitSeconds) {
-    waitSeconds = waitSeconds || 6
-    let start = new Date().getTime()
-    while (new Date().getTime() - start < waitSeconds * 1000) {
-      if (this.isTimeout()) {
-        return false
-      }
-      if (commonFunctions.myCurrentPackage() != _package_name) {
-        this.pushLog('已跳转其它应用，判定广告已打开')
-        return true
-      }
-      if (this.isAdPageVisible()) {
-        this.pushLog('检测到广告页元素，判定广告已打开')
-        return true
-      }
-      if (!this.isOnCoinPage(500)) {
-        this.pushLog('页面已离开赚云币页，判定广告已打开')
-        return true
-      }
-      sleep(800)
-    }
     return false
   }
 
@@ -1772,7 +1728,9 @@ function SignRunner () {
       }
       this._needNextAd = false
       result = this.watchOneAdRound(round === 0 ? desc : desc + '(续' + round + ')')
-      if (this._reachLimit || !this._needNextAd || this.isTimeout()) {
+      // allowChainNextAd=false 的任务（每日看视频：点一次=看一条）即使弹窗里有
+      // 「观看视频后开启」也不连看，避免一条路连着看十几分钟、外层看不到进度
+      if (this._reachLimit || !this._allowChainNextAd || !this._needNextAd || this.isTimeout()) {
         break
       }
       this.pushLog('奖励弹窗下方还有「观看视频」，继续观看下一条广告')
