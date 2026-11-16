@@ -254,6 +254,8 @@ function SignRunner () {
     this._miniGameAd = false
     this._keepWatchAd = false
     this._restarting = false
+    // 单次执行内最多重启 2 次：页面异常时每轮都强停重开会让整个脚本十几分钟出不来
+    this._restartTimes = 0
     // 关闭叉识图失败时间戳：同一屏连续调用时避免重复做整轮匹配
     this._closeTplMissAt = 0
     // 是否追奖励弹窗下方的「观看视频后开启」（默认追，只有惊喜礼包/开宝箱这类连看入口需要）
@@ -272,7 +274,6 @@ function SignRunner () {
     }
     // 第一次进入赚云币页会弹「签到成功」，下方「额外领取云币」点一次可看广告，看完回点「我知道了」
     this.handleSignSuccessBonusDialog()
-    // 依次执行各广告任务（测试界面可通过 onlySubTask 指定只跑某个子任务，日常执行时为空=全部执行）
     // 依次执行各广告任务（测试界面可通过 onlySubTask 指定只跑某个子任务，日常执行时为空=全部执行）
     // 每个子任务单独 try/catch：单个任务异常不再把整个脚本打死（异常终止后框架会当成脚本崩溃）
     let self = this
@@ -743,9 +744,11 @@ function SignRunner () {
     }
     this.pushWarningLog('点击赚云币Tab后仍未确认进入赚云币页')
     // 兜底：页面卡死/异常（常见于停在广告页或黑屏、找不到赚云币Tab）→ 强制停止云宝宝后重新打开再试一次
-    if (!this._restarting && !this.isTimeout()) {
+    // 重启次数做了全局限流（一次执行最多 2 次），否则每轮都强停重开会把整轮时间吃光
+    if (!this._restarting && !this.isTimeout() && (this._restartTimes || 0) < 2) {
       this._restarting = true
-      this.pushWarningLog('页面异常，强制停止云宝宝后重新打开再试一次')
+      this._restartTimes = (this._restartTimes || 0) + 1
+      this.pushWarningLog('页面异常，强制停止云宝宝后重新打开再试一次（第' + this._restartTimes + '次）')
       let reopened = this.openYunbaobao()
       if (reopened) {
         // 重试期间保持 _restarting=true，防止重开后再失败导致无限重启
@@ -757,6 +760,8 @@ function SignRunner () {
       this.pushWarningLog('强制停止后重新打开云宝宝失败')
     } else if (this._restarting) {
       this.pushWarningLog('已尝试重启云宝宝仍无法进入赚云币页，放弃本轮')
+    } else if ((this._restartTimes || 0) >= 2) {
+      this.pushWarningLog('本次执行已重启 ' + this._restartTimes + ' 次，不再重启，放弃进入赚云币页')
     }
     return false
   }
@@ -1624,6 +1629,13 @@ function SignRunner () {
     let maxWatch = 10
     let watched = 0
     let finished = false
+    // 本任务预算：10 条广告 × 约 40 秒 ≈ 7 分钟，给 5 分钟上限，
+    // 超了就先把本条任务收尾，避免一条任务把整轮 8.5 分钟预算全吃光、看着像卡死
+    let taskStart = new Date().getTime()
+    let taskBudget = 5 * 60 * 1000
+    // 进度未增长的连续次数：入口点不动/今日次数已用完时会一直空转，连续 2 次就收工
+    let lastProgress = -1
+    let noProgress = 0
     // 判断是否已看完（方式1）：识别「每日看视频10次(N/10)」里的次数，已到 10 直接结束
     let done = this.readDailyWatchProgress()
     if (done >= 10) {
@@ -1633,6 +1645,12 @@ function SignRunner () {
     while (!finished && watched < maxWatch) {
       if (this.isTimeout()) {
         this.pushWarningLog('执行超时，结束每日看视频')
+        break
+      }
+      // 任务级预算：防止「一直点不动」把整轮时间耗完
+      let used = Math.round((new Date().getTime() - taskStart) / 1000)
+      if (used > taskBudget / 1000) {
+        this.pushWarningLog('每日看视频本轮已耗时' + used + '秒，达到任务预算，先结束')
         break
       }
       let progressBtn = this.findProgressBtn()
@@ -1656,6 +1674,7 @@ function SignRunner () {
       // 区别只是这里没有弹窗、直接进广告页，所以不再单独探测「广告是否打开」，
       // 交给 watchAd 内部的 3 秒等待 + 广告页识别处理
       watched++
+      let roundStart = new Date().getTime()
       this.watchAd('每日看视频', { allowChainNextAd: false, skipBetweenWait: true })
       // 看完后回到赚云币页，准备下一次（残留广告先关闭再回）
       if (!this.ensureCoinPage('每日看视频-回页')) {
@@ -1669,6 +1688,22 @@ function SignRunner () {
         finished = true
         break
       }
+      // 进度没往前走：点击数在涨但次数不变，说明这条根本没看成（入口点不动/次数已用完），
+      // 连续 2 次就收工，别在这里空转
+      if (nowDone >= 0) {
+        if (lastProgress >= 0 && nowDone <= lastProgress) {
+          noProgress++
+          if (noProgress >= 2) {
+            this.pushWarningLog('连续2次进度未增长（仍为' + nowDone + '/10），判定入口无效，结束每日看视频')
+            finished = true
+            break
+          }
+        } else {
+          noProgress = 0
+        }
+        lastProgress = nowDone
+      }
+      this.pushLog('每日看视频 本轮耗时' + Math.round((new Date().getTime() - roundStart) / 1000) + '秒')
     }
     if (finished || watched > 0) {
       this.setSubTaskExecuted(DAILY_WATCH_VIDEO)
@@ -3897,7 +3932,7 @@ function SignRunner () {
    * 挽留弹窗里选「放弃不看 / 残忍离开 / 关闭广告」（微信小游戏类广告统一用这个）
    */
   this.giveUpWatchIfPresent = function () {
-    let names = ['^放弃不看$', '放弃不看', '^残忍离开$', '残忍离开', '^关闭广告$']
+    let names = ['^放弃不看$', '放弃不看', '^残忍离开$', '残忍离开', '^关闭广告$', '^立即退出$']
     for (let i = 0; i < names.length; i++) {
       let btn = widgetUtils.widgetGetOne(names[i], 600, false, true)
       if (btn && automator.checkCenterClickable(btn)) {
