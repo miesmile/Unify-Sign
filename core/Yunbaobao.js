@@ -49,9 +49,10 @@ const JUMP_AD_CASES = [
   // 「点击打开或下载第三方应用」的几种写法合并成一条（原来三条重复）
   { regex: /(点击)?(打开|下载).{0,6}第三方应用/, desc: '点击打开或下载第三方应用' },
   { regex: /立即体验|马上体验|立即试玩/, desc: '立即体验' },
+  { regex: /立即抢购|点击抢购|马上抢购/, desc: '立即抢购' },
   { regex: /(去体验|体验|试玩|去玩).{0,10}\d+\s*(秒|s)/, desc: '去体验N秒（必须跳转）' },
   // 「点击广告，即可获得奖励」类：点一下跳转就算完成，跳转后可以直接返回，不用等倒计时（noWait）
-  { regex: /点击(该|此)?广告.{0,10}(即可|就能|便能|马上).{0,6}(获得|领取|得).{0,4}(奖励|云币)/, desc: '点击广告即可获得奖励（可直接返回）', noWait: true },
+  { regex: /点击(该|此)?广告.{0,10}(即可|就能|便能|马上).{0,6}(获得|领取|得|拿).{0,4}(奖励|云币)/, desc: '点击广告即可获得奖励（可直接返回）', noWait: true },
 ]
 
 /**
@@ -157,6 +158,24 @@ const CONTINUE_AD_CASES = [
   { regex: /继续\s*播放/, desc: '继续播放' },
   { regex: /继续\s*观看/, desc: '继续观看' },
   { regex: /^继续$/, desc: '继续按钮' },
+]
+
+/**
+ * 系统 / 第三方弹窗处理表 —— 主要用在「返回云宝宝」途中
+ * 场景：跳转广告返回时，流氓应用不断自启并连弹「快速关闭进程」「应用无响应」「是否开启通知」等，
+ *       不点掉就卡在别的应用里，回不到云宝宝。
+ * 结构：{ hint: 弹窗特征文案, action: 要点的按钮文案, back: 找不到按钮时是否按返回键 }
+ * - hint 与 action 用「子串匹配」，只有两者同一屏同时命中才动手，避免把正文里的字当成弹窗
+ * - 顺序即优先级，先写更具体的（如「快速关闭进程」必须排在「快速关闭」前面）
+ * - 遇到新弹窗直接往表里加一行即可，不用改代码
+ */
+const SYSTEM_POPUP_CASES = [
+  { hint: '快速关闭进程', action: '关闭进程' },
+  { hint: '快速关闭', action: '关闭' },
+  { hint: '停止运行', action: '确定' },
+  { hint: '无响应|屡次停止', action: '确定' },
+  { hint: '开启通知|通知权限|悬浮窗|后台弹出', action: '取消' },
+  { hint: '想要打开', action: '仅打开一次' },
 ]
 
 /**
@@ -1515,6 +1534,8 @@ function SignRunner () {
     // 每次任务开始重置「已达上限」标记
     this._reachLimit = false
     this.pushLog('点击「观看视频后开启」看广告（真机上限约15次，命中「已达上限」即停）')
+    // 两条广告的间隔必须放在点击之前：点下去这条广告就开始播了，点完再等就是等在新广告里
+    this.waitBetweenAds(tag)
     this.clickNextAdAndCheckLimit(openBtn, '观看视频后开启')
     if (this._reachLimit) {
       this.pushLog(tag + ' 已达观看上限，结束')
@@ -1642,6 +1663,8 @@ function SignRunner () {
           continue
         }
         let ok = false
+        // 这次点击可能直接开始下一条广告（看视频领/补领），所以间隔要在点击之前等
+        this.waitBetweenAds(patterns[i].name)
         try {
           ok = this.clickByBounds(list[j], patterns[i].name)
         } catch (e) {
@@ -1738,7 +1761,9 @@ function SignRunner () {
       // 交给 watchAd 内部的 3 秒等待 + 广告页识别处理
       watched++
       let roundStart = new Date().getTime()
-      this.watchAd('每日看视频', { allowChainNextAd: false, skipBetweenWait: true })
+      // 每日看视频要点 10 次，刻意不在这里等 10~50 秒的广告间隔（每次空等半分钟任务预算会被吃光），
+      // 这是四条入口里唯一不做间隔的：别的入口点一次=看一条，这里点十次
+      this.watchAd('每日看视频', { allowChainNextAd: false })
       // 看完后回到赚云币页，准备下一次（残留广告先关闭再回）
       if (!this.ensureCoinPage('每日看视频-回页')) {
         this.pushWarningLog('返回赚云币页失败，结束每日看视频')
@@ -1805,18 +1830,16 @@ function SignRunner () {
    * @param {Object} options { allowChainNextAd: false } 不追弹窗里的下一条广告
    *   —— 每日看视频这种「点一次进行中 = 看一条广告」的任务必须传 false，
    *      否则会在这条广告里连着看十几分钟，外层进度看起来就卡死不动
-   *   { skipBetweenWait: true } 跳过两次广告间 10~50 秒的随机等待
-   *   —— 每日看视频要点 10 次，每次都空等半分钟会平白多出好几分钟
    */
   this.watchAd = function (desc, options) {
     options = options || {}
     this._allowChainNextAd = options.allowChainNextAd !== false
     // 每进入一条新的广告流程都重新判断「已达上限」，避免上一任务的标记影响后续任务
     this._reachLimit = false
-    // 两次广告间随机间隔：放在「进入下一条广告之前」，先打印再等待
-    if (this._adCount && this._adCount > 0 && options.skipBetweenWait !== true) {
-      this.waitBetweenAds()
-    }
+    // 注意：两次广告间的随机间隔不在这里等待。
+    // 所有调用方都是「先点了开始广告的按钮（观看视频后开启 / 看视频 / 进行中）再调 watchAd」，
+    // 在这里等等于等在新广告已经开始播放之后：日志上看着像"间隔时间不对"，广告同时也在干等中白白流逝。
+    // 间隔统一放在「点击开始广告之前」，由各调用方在点击前调用 waitBetweenAds()
     let maxRounds = 15
     let result = true
     for (let round = 0; round < maxRounds; round++) {
@@ -1944,17 +1967,35 @@ function SignRunner () {
 
   /**
    * 两次看广告之间随机等待 10-50 秒（模拟真人操作节奏，防止被识别为脚本）
+   * 必须在「点击开始下一条广告」之前调用：调用方都是先点按钮再进广告流程，
+   * 放在点击之后等，就变成等在新广告的播放过程中（日志看着像"间隔时间不对"）
+   * 日志会带计划秒数和实际等待秒数，写文件时还有毫秒时间戳，可与前后两条广告的时间对照
+   * @param {String} tag 这次间隔发生在哪条广告之前（写进日志便于对照）
+   * @returns {Number} 实际等待秒数
    */
-  this.waitBetweenAds = function () {
+  this.waitBetweenAds = function (tag) {
+    // 整个流程的第一条广告不需要间隔（此前还没看过广告）
+    if (!this._adCount || this._adCount <= 0) {
+      return 0
+    }
     let sec = 10 + Math.floor(Math.random() * 41)
-    this.pushLog('两次广告间随机等待' + sec + '秒')
+    let label = tag ? '（' + tag + '）' : ''
+    this.pushLog('两次广告间隔：' + label + '计划等待' + sec + '秒，等完再点下一条广告')
     let start = new Date().getTime()
-    while (new Date().getTime() - start < sec * 1000) {
+    let end = start + sec * 1000
+    let interrupted = false
+    while (new Date().getTime() < end) {
       if (this.isTimeout()) {
+        interrupted = true
         break
       }
       sleep(1000)
+      let left = Math.max(0, Math.round((end - new Date().getTime()) / 1000))
+      this.replaceLastLog('两次广告间隔：' + label + '计划' + sec + '秒，剩余' + left + '秒')
     }
+    let actual = Math.round((new Date().getTime() - start) / 1000)
+    this.pushLog('广告间隔结束：' + label + '实际等待' + actual + '秒' + (interrupted ? '（整体执行已超时，提前中断）' : ''))
+    return actual
   }
 
   /**
@@ -2131,7 +2172,7 @@ function SignRunner () {
     if (!this._reachLimit && !this.isAdPageVisible()) {
       let nextAd = this.findNextAdButton()
       if (nextAd) {
-        this.waitBetweenAds()
+        this.waitBetweenAds('奖励弹窗续看')
         this.pushLog('奖励弹窗下方还有「观看视频」，继续观看下一条广告')
         if (this.clickNextAdAndCheckLimit(nextAd, '观看视频后开启(续)')) {
           this._needNextAd = !this._reachLimit
@@ -2434,7 +2475,7 @@ function SignRunner () {
     let nextAdBtn = this.findNextAdButton()
     if (nextAdBtn) {
       // 两次广告间隔：先等待再点击，确保间隔发生在下一条广告开始之前（不在广告里干等）
-      this.waitBetweenAds()
+      this.waitBetweenAds('返回后续看')
       this.pushLog('返回后检测到「观看视频」按钮，点击继续看广告（不关闭弹窗）')
       if (this.clickNextAdAndCheckLimit(nextAdBtn, '观看视频(奖励弹窗)')) {
         if (this._reachLimit) {
@@ -2528,7 +2569,7 @@ function SignRunner () {
         let nextAd = this.findNextAdButton()
         if (nextAd) {
           this.pushLog(atag + '检测到「观看视频后开启」，点击继续（不关闭弹窗）')
-          this.waitBetweenAds()
+          this.waitBetweenAds(atag + '续看')
           if (this.clickNextAdAndCheckLimit(nextAd, atag + '观看视频后开启')) {
             this._needNextAd = !this._reachLimit
             if (this._reachLimit) {
@@ -2586,6 +2627,10 @@ function SignRunner () {
   this.backToYunbaobao = function () {
     let limit = 3
     while (limit-- > 0) {
+      // 返回途中会碰到流氓应用自启 + 各种拦截弹窗（「快速关闭进程」等），先扫一遍再判断包名
+      if (this.sweepSystemPopups('返回途中') > 0) {
+        sleep(500)
+      }
       if (commonFunctions.myCurrentPackage() == _package_name) {
         sleep(1000)
         // 关键：回到云宝宝后不要立刻去找赚云币 Tab，先处理广告残留
@@ -2606,6 +2651,8 @@ function SignRunner () {
         // 忽略
       }
       sleep(1200)
+      // 按返回后可能又弹出拦截框（流氓应用自启），扫一遍再进下一轮
+      this.sweepSystemPopups('返回键后')
     }
     let final = commonFunctions.myCurrentPackage() == _package_name
     if (!final) {
@@ -2627,6 +2674,8 @@ function SignRunner () {
       this.pushLog('硬兜底：把云宝宝拉回前台（第' + (i + 1) + '次）')
       this.launchYunbaobaoPackage('拉回前台')
       this.confirmJumpDialogIfNeeded(true)
+      // 拉回前台时流氓应用常弹「快速关闭进程」等拦截框，先扫掉
+      this.sweepSystemPopups('拉回前台')
       this.handleAdResidueAfterReturn('拉回前台后', false)
       if (commonFunctions.myCurrentPackage() == _package_name && this.isOnCoinPage(800) && !this.isAdPageVisible()) {
         this.pushLog('已把云宝宝拉回前台并回到赚云币页')
@@ -3696,6 +3745,90 @@ function SignRunner () {
   }
 
   /**
+   * 检测并处理一个系统 / 第三方弹窗（规则见 SYSTEM_POPUP_CASES）
+   * 一次控件查询把所有规则的特征文案一起捞出来（6 条规则只花一次 300ms），
+   * 再按命中的文案定位对应按钮——只有「特征文案」和「按钮」同屏同时存在才动手，避免误点正文
+   * @param tag 日志标记（如「返回途中」）
+   * @returns {boolean} 是否处理掉一个弹窗
+   */
+  this.handleSystemPopupIfPresent = function (tag) {
+    // widgetGetOne/widgetGetAll 内部是 textMatches（整串匹配），这里包一层 .* 才是「子串匹配」；
+    // 分组是为了让 '无响应|屡次停止' 这类带 | 的规则保持整体语义
+    let hintSource = SYSTEM_POPUP_CASES.map(c => '(' + c.hint + ')').join('|')
+    let list = null
+    try {
+      list = widgetUtils.widgetGetAll('.*(' + hintSource + ').*', 300, false)
+    } catch (e) {
+      list = null
+    }
+    if (!list || list.length === 0) {
+      return false
+    }
+    for (let k = 0; k < list.length; k++) {
+      let label = ''
+      try {
+        label = (list[k].text && list[k].text()) || (list[k].desc && list[k].desc()) || ''
+      } catch (e) {
+        label = ''
+      }
+      if (!label) {
+        continue
+      }
+      for (let i = 0; i < SYSTEM_POPUP_CASES.length; i++) {
+        let c = SYSTEM_POPUP_CASES[i]
+        if (!new RegExp('.*(' + c.hint + ').*').test(label)) {
+          continue
+        }
+        if (c.action) {
+          let btn = null
+          try {
+            btn = widgetUtils.widgetGetOne('.*(' + c.action + ').*', 400, true, true)
+          } catch (e) {
+            btn = null
+          }
+          if (btn && automator.checkCenterClickable(btn)) {
+            this.pushLog('处理系统弹窗[' + (tag || '') + ']：' + label + ' -> 点击「' + c.action + '」')
+            automator.clickCenter(btn)
+            sleep(600)
+            return true
+          }
+        }
+        // 有特征但按钮没找到 / 按钮不可点：按返回键关掉它
+        if (c.back) {
+          this.pushLog('处理系统弹窗[' + (tag || '') + ']：' + label + ' -> 按返回键')
+          try {
+            automator.back()
+          } catch (e) {
+            // 忽略
+          }
+          sleep(600)
+          return true
+        }
+      }
+    }
+    return false
+  }
+
+  /**
+   * 连续扫掉多个弹窗（流氓应用常常一个接一个弹），最多处理 maxCount 个
+   * @param tag 日志标记
+   * @param maxCount 最多处理数量，默认 3
+   * @returns {number} 实际处理掉的弹窗数量
+   */
+  this.sweepSystemPopups = function (tag, maxCount) {
+    maxCount = maxCount || 3
+    let handled = 0
+    while (handled < maxCount) {
+      if (!this.handleSystemPopupIfPresent(tag)) {
+        break
+      }
+      handled++
+      sleep(500)
+    }
+    return handled
+  }
+
+  /**
    * 是否显示「恭喜获得」奖励弹窗
    * （跳转类广告返回后 / 小程序类广告层层返回后 都会停在这个弹窗，下方常带「观看视频后开启」）
    */
@@ -3850,7 +3983,7 @@ function SignRunner () {
     if (!btn) {
       return false
     }
-    this.waitBetweenAds()
+    this.waitBetweenAds('奖励弹窗续看')
     this.pushLog('奖励弹窗下方还有「观看视频」，继续看下一条广告')
     if (!this.clickNextAdAndCheckLimit(btn, '观看视频后开启(续)')) {
       return false
@@ -3939,7 +4072,7 @@ function SignRunner () {
    * 挽留弹窗里选「放弃不看 / 残忍离开 / 关闭广告」（微信小游戏类广告统一用这个）
    */
   this.giveUpWatchIfPresent = function () {
-    let names = ['^放弃不看$', '放弃不看', '^残忍离开$', '残忍离开', '^关闭广告$', '^立即退出$']
+    let names = ['^放弃不看$', '放弃不看', '^残忍离开$', '残忍离开', '^关闭广告$', '^立即退出$', '^放弃福利$']
     for (let i = 0; i < names.length; i++) {
       let btn = widgetUtils.widgetGetOne(names[i], 600, false, true)
       if (btn && automator.checkCenterClickable(btn)) {
@@ -4040,6 +4173,7 @@ function SignRunner () {
       return false
     }
     this.pushLog('检测到签到成功弹窗，点击「额外领取云币」看广告')
+    this.waitBetweenAds('签到额外奖励')
     if (!this.clickBtn(bonusBtn, '额外领取云币')) {
       this.pushWarningLog('「额外领取云币」点击失败')
       return false
