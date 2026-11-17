@@ -253,7 +253,6 @@ function SignRunner () {
     this._adCount = 0
     this._reachLimit = false
     this._miniGameAd = false
-    this._keepWatchAd = false
     this._restarting = false
     // 单次执行内最多重启 2 次：页面异常时每轮都强停重开会让整个脚本十几分钟出不来
     this._restartTimes = 0
@@ -1227,7 +1226,11 @@ function SignRunner () {
         return false
       }
       let key = Math.round(b.centerX() / 30) + '_' + Math.round(b.centerY() / 30)
-      if (this._continueClicked && this._continueClicked[key]) {
+      // 同一坐标只做「短时间去重」（3 秒）。原来整轮广告只点一次，
+      // 广告暂停一次点开后再次暂停时就不会再点，广告就一直停在暂停态、最后被当成跳转处理
+      let now = new Date().getTime()
+      let last = this._continueClicked && this._continueClicked[key]
+      if (last && now - last < 3000) {
         return false
       }
       if (!this._continueClicked) {
@@ -1236,7 +1239,7 @@ function SignRunner () {
       this.pushLog('点击「继续」留在应用内看广告：' + (content || ''))
       automator.click(b.centerX(), b.centerY())
       sleep(600)
-      this._continueClicked[key] = true
+      this._continueClicked[key] = now
       return true
     } catch (e) {
       this.pushWarningLog('点击继续失败：' + e)
@@ -1842,7 +1845,6 @@ function SignRunner () {
     this.pushLog('开始观看广告：' + desc)
     // 每次观看广告重置「继续」点击去重记录与广告类型标记
     this._continueClicked = {}
-    this._keepWatchAd = false
     this._miniGameAd = false
     this._reachLimit = false
     // 重置「继续看下一条」标记：否则上一轮的值会让返回后的 residue 判断误判
@@ -1857,14 +1859,24 @@ function SignRunner () {
         result = this.handleWechatAd()
         // 小程序返回后停在「恭喜获得」，下方若还有「观看视频后开启」就继续看
         this.continueIfNextAdButton()
-      } else if (adInfo.jumpBtn && !adInfo.keepWatch) {
-        result = this.watchJumpAd(adInfo.jumpBtn, desc)
-      } else {
-        if (adInfo.jumpBtn && adInfo.keepWatch) {
-          // 右上角「奖励将于N秒后发放」+ 下方「我要加速领奖励」：以看满为准，不点跳转
-          this.pushLog('该广告可看满（奖励将于N秒后发放），忽略跳转按钮：' + (adInfo.jumpBtn.content || ''))
+      } else if (adInfo.jumpBtn) {
+        // 跳转前二次确认：不少广告先露出「跳转APP领奖励」，1~2 秒后才出现「继续看视频」。
+        // 能留在应用内看完就不跳转，所以这里再等最多 2 秒复检一次「继续」按钮
+        let stayHere = false
+        for (let i = 0; i < 2; i++) {
+          sleep(1000)
+          if (this.clickContinueAdIfPresent(true)) {
+            stayHere = true
+            break
+          }
         }
-        this._keepWatchAd = !!adInfo.keepWatch
+        if (stayHere) {
+          this.pushLog('跳转前检测到「继续看视频」，改为留在应用内看满')
+          result = this.watchCountdownAd(desc)
+        } else {
+          result = this.watchJumpAd(adInfo.jumpBtn, desc)
+        }
+      } else {
         result = this.watchCountdownAd(desc)
       }
     } else if (this.isWechatForeground()) {
@@ -1906,10 +1918,16 @@ function SignRunner () {
           if (adInfo2.wechat) {
             result = this.handleWechatAd()
             this.continueIfNextAdButton()
-          } else if (adInfo2.jumpBtn && !adInfo2.keepWatch) {
-            result = this.watchJumpAd(adInfo2.jumpBtn, desc)
+          } else if (adInfo2.jumpBtn) {
+            // 同样先复检「继续看视频」，有就留在应用内看满
+            sleep(1000)
+            if (this.clickContinueAdIfPresent(true)) {
+              this.pushLog('跳转前检测到「继续看视频」，改为留在应用内看满')
+              result = this.watchCountdownAd(desc)
+            } else {
+              result = this.watchJumpAd(adInfo2.jumpBtn, desc)
+            }
           } else {
-            this._keepWatchAd = !!adInfo2.keepWatch
             result = this.watchCountdownAd(desc)
           }
         } else {
@@ -1962,22 +1980,15 @@ function SignRunner () {
       if (this.isWechatForeground()) {
         return { countdown: null, closeBtn: null, jumpBtn: null, wechat: true }
       }
-      // 0.1) 「奖励将于N秒后发放」：明确可以看满，优先于跳转按钮（不能被「我要加速领奖励」带偏去跳转）
-      if (this.rewardCountdownVisible()) {
-        return { countdown: { content: '奖励将于N秒后发放' }, closeBtn: null, jumpBtn: null, keepWatch: true }
-      }
       // 0) 优先点「继续看视频」留在应用内（控件快查，命中即点击并重新检测）
+      // 这一步必须是第一个判断：屏幕左上/右上任何位置都可能挂着一个倒计时文案，
+      // 但它动不动、是不是"奖励将于N秒后发放"都读不准，靠它判"可看满"会把广告卡在暂停态
       if (this.clickContinueAdIfPresent(true)) {
         continue
       }
       // 1) 跳转类按钮（控件，已知文案快查）—— 优先于倒计时
       let jumpBtn = this.findJumpButtonByWidgetFast()
       if (jumpBtn) {
-        // 兜底：再 OCR 确认页面上是否存在「N秒后可拿奖励」看满文案（这类文案常以图片形式出现）
-        if (this.rewardCountdownByOcr()) {
-          this.pushLog('页面上存在可看满倒计时文案，按看满处理，忽略跳转按钮')
-          return { countdown: { content: '可看满倒计时' }, closeBtn: null, jumpBtn: jumpBtn, keepWatch: true }
-        }
         return { countdown: null, closeBtn: null, jumpBtn: jumpBtn }
       }
       // 2) OCR 全屏识别：先扫「继续」文案，再找跳转文案，最后找右上角倒计时
@@ -1996,14 +2007,6 @@ function SignRunner () {
             // 2a) 继续文案优先（命中即点击，随后重新检测）
             if (this.clickContinueByFinds(finds)) {
               continue
-            }
-            // 2b) 「奖励将于N秒后发放」「去体验N秒后可直接拿奖励」优先（可看满），避免被下方「我要加速领奖励」误判成跳转
-            for (let i = 0; i < finds.length; i++) {
-              let label = finds[i].label || ''
-              if (isRewardCountdownText(label)) {
-                this.pushLog('OCR识别到可看满提示：' + label)
-                return { countdown: { bounds: () => finds[i].bounds, content: label }, closeBtn: null, jumpBtn: null, keepWatch: true }
-              }
             }
             // 2c) 跳转文案（含「去体验X秒后可拿奖励」类引导，命中即按跳转处理）
             for (let i = 0; i < finds.length; i++) {
@@ -2088,21 +2091,9 @@ function SignRunner () {
           if (this.abandonWelfareIfPresent()) {
             continue
           }
-          // 回来再看一眼右上角：出现「奖励将于N秒后发放」说明这条能看满，后续忽略跳转
-          if (!this._keepWatchAd && this.rewardCountdownVisible()) {
-            this._keepWatchAd = true
-            this._jumpFound = null
-            this.pushLog('确认本广告可看满，忽略跳转按钮')
-          }
         }
-        // 监控线程发现跳转按钮 → 先 OCR 确认是不是「N秒后可拿奖励」的看满广告（别被下方「我要加速领奖励」带偏）
-        if (this._jumpFound && !this._keepWatchAd) {
-          if (this.rewardCountdownByOcr()) {
-            this._keepWatchAd = true
-            this._jumpFound = null
-            this.pushLog('OCR确认页面可看满，忽略跳转按钮，继续等满')
-            continue
-          }
+        // 监控线程发现跳转按钮 → 切换为跳转领取
+        if (this._jumpFound) {
           let jumpBtn = this._jumpFound
           this._jumpFound = null
           this.pushLog('并行监控发现跳转按钮，切换为跳转领取')
@@ -2124,8 +2115,8 @@ function SignRunner () {
     } finally {
       this.stopJumpMonitor(monitor)
     }
-    // 看满后监控可能刚发现跳转 → 优先处理跳转（跳转式弹窗常在倒计时结束时出现；可看满广告忽略）
-    if (this._jumpFound && !this._keepWatchAd) {
+    // 看满后监控可能刚发现跳转 → 优先处理跳转（跳转式弹窗常在倒计时结束时出现）
+    if (this._jumpFound) {
       let jumpBtn = this._jumpFound
       this._jumpFound = null
       this.pushLog('看满后监控发现跳转按钮，切换为跳转领取')
@@ -2228,9 +2219,9 @@ function SignRunner () {
           text = ''
         }
         if (isContinueAdText(text)) {
-          // 已点过的继续元素不再重复通知（避免一直卡在继续上、跳转永不检测）
+          // 刚点过（3 秒内）的继续元素跳过，看同屏其它继续按钮
           if (this.isContinueClicked(list[i])) {
-            break
+            continue
           }
           this._continuePending = true
           return true
@@ -2248,7 +2239,7 @@ function SignRunner () {
         }
         if (isContinueAdText(text)) {
           if (this.isContinueClicked(list2[i])) {
-            break
+            continue
           }
           this._continuePending = true
           return true
@@ -2268,7 +2259,10 @@ function SignRunner () {
         return false
       }
       let key = Math.round(b.centerX() / 30) + '_' + Math.round(b.centerY() / 30)
-      return !!(this._continueClicked && this._continueClicked[key])
+      let last = this._continueClicked && this._continueClicked[key]
+      // 与 clickContinueTarget 保持一致：只做 3 秒短时去重，
+      // 广告看一半再次暂停时还能再点一次继续，不会整轮只认第一次
+      return !!(last && new Date().getTime() - last < 3000)
     } catch (e) {
       return false
     }
@@ -3847,53 +3841,6 @@ function SignRunner () {
   }
 
   /**
-   * 右上角是否显示「奖励将于N秒后发放」——出现即说明这条广告可以看满，优先于跳转按钮
-   */
-  this.rewardCountdownVisible = function () {
-    let topRegion = m => m.boundsInside(config.device_width * 0.3, 0, config.device_width, config.device_height * 0.35)
-    let btn = widgetUtils.widgetGetOne('(奖励将于|\\d+\\s*(秒|s).{0,8}(发放|领取|拿奖励|领奖励|可直接))', 900, true, true, topRegion)
-    if (btn && btn.content) {
-      if (isRewardCountdownText(btn.content) || /奖励将于/.test(btn.content)) {
-        this.pushLog('右上角识别到可看满提示：' + btn.content)
-        return true
-      }
-    }
-    return false
-  }
-
-  /**
-   * OCR 兜底确认页面上是否存在「N秒后可拿奖励」看满文案（这类文案常是图片，控件读不到）
-   */
-  this.rewardCountdownByOcr = function () {
-    if (!localOcrUtil.enabled) {
-      return false
-    }
-    let screen = commonFunctions.captureScreen()
-    if (!screen) {
-      return false
-    }
-    let finds = null
-    try {
-      // region 语义为 [x, y, width, height]，y+height 不能超过屏幕高度
-      finds = localOcrUtil.recognizeWithBounds(screen, [0, 0, config.device_width, Math.floor(config.device_height * 0.35)])
-    } catch (e) {
-      logUtils.debugInfo(['OCR确认看满文案异常：{}', e])
-      return false
-    }
-    if (!finds || finds.length == 0) {
-      return false
-    }
-    for (let i = 0; i < finds.length; i++) {
-      let label = finds[i].label || ''
-      if (isRewardCountdownText(label)) {
-        this.pushLog('OCR确认可看满文案：' + label)
-        return true
-      }
-    }
-    return false
-  }
-
-  /**
    * 奖励弹窗下方若还有「观看视频后开启」，点击继续看下一条广告
    * （点完立即检测「已达上限」，达上限则不继续）
    * @returns {boolean} 是否点击并需要继续
@@ -4089,6 +4036,7 @@ function SignRunner () {
   this.handleSignSuccessBonusDialog = function () {
     let bonusBtn = widgetUtils.widgetGetOne('额外领取.{0,4}云币|额外领取', 2500, false, true)
     if (!bonusBtn) {
+      this.pushLog('未检测到签到成功弹窗')
       return false
     }
     this.pushLog('检测到签到成功弹窗，点击「额外领取云币」看广告')
