@@ -156,6 +156,10 @@ let default_config = {
     }
   ].concat(custom_config.supported_signs || [])
 }
+// supported_signs 与 extends/CustomConfig.js 合并后按 taskCode 去重（保留先出现的那个）
+// 作用：自定义任务写在这里时排在默认任务前面；config.js 被更新覆盖后，CustomConfig.js 里的同名定义继续兜底
+default_config.supported_signs = default_config.supported_signs.filter((sign, index, arr) =>
+  arr.findIndex(item => item.taskCode === sign.taskCode) === index)
 // 不同项目需要设置不同的storageName，不然会导致配置信息混乱
 let CONFIG_STORAGE_NAME = 'unify_sign'
 let PROJECT_NAME = '聚合签到'
@@ -198,4 +202,4 @@ config.exportIfNeeded(module, null)
 
 // 扩展配置
 extendSignConfig(default_config, config, CONFIG_STORAGE_NAME)
-config.code_version = 'v2.4.2.2'
+config.code_version = 'v3.0.0'
