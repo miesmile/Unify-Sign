@@ -53,6 +53,13 @@ const PROGRESS_TEXT = /[(（\[]\s*\d+\s*\/\s*\d+\s*[)）\]]/
 const BROWSE_DONE_TEXT = /任务已完成|浏览已完成|浏览完成|完成浏览|奖励已到账|恭喜完成|任务完成啦/
 // 直播页固定话术（daily.py LIVE_PAGE_RE）
 const LIVE_PAGE_TEXT = /正在直播|\d+\s*人观看|说点什么|直播间|点赞/
+// 跳转确认的场景词与允许/拒绝词（daily.py launch_confirmation）：
+// 只有画面上出现「启动应用/链接提示/正在离开…」这类场景时才算跳转确认框，
+// 否则一律不点，避免把商品页的「打开」或权限弹窗的「允许」当成跳转确认。
+const JUMP_SCENE_TEXT = /启动应用|链接提示|打开应用|想要打开|是否打开|即将离开|正在离开|离开.{0,8}打开|跳转提示|外部应用/
+const JUMP_ALLOW_TEXT = /^(?:本次允许|允许本次|仅本次|仅打开一次|允许|确认|确认打开|打开|好，继续跳转|继续前往|仍要打开|仍要前往|打开应用)$/
+// 「始终允许」这类永久授权不属于一次性跳转，点了会改系统设置，明确排除
+const JUMP_DENY_TEXT = /^(?:始终允许|总是允许|不再允许|不再提示|允许所有|授权|同意授权)$/
 
 // 跨应用停留下限（coins/config.json daily_page.app_visit_seconds）
 const APP_FLOORS = {
@@ -87,6 +94,11 @@ const OPTIONS = {
   browseExtraSeconds: 2,         // 计时结束后多留一点，等奖励到账
   maxAttemptsPerTask: 2,         // 同一行最多尝试次数
   maxExpandTimes: 2,             // 「展开」最多点几次
+  maxRestarts: 2,                // 单次执行最多强停重启淘宝的次数（daily.py rescan_restart_max）
+  maxRescanRestarts: 2,          // 面板「没任务了」之后重启复查的次数（rescan_rounds 缩水版）
+  searchBudgetSeconds: 30,       // 搜索提交到确认结果页的时间预算（daily.py page_timeout）
+  searchStaySeconds: 8,          // 商品搜索结果页停留时长
+  destinationTimeoutSeconds: 6,  // 跨应用跳转后等「页面有内容」的时限
   enable88Vip: true              // 可选：88VIP 每日签到（后端没有这块流程，失败不影响主流程）
 }
 // 入口搜索词（对齐 backend/app/taobao/configs/base.json 的 search_keyword / task_search_keyword）
@@ -112,23 +124,70 @@ function actionOf (text) {
 function chinese (text) {
   return /[\u4e00-\u9fa5]/.test(text || '')
 }
-/** 统一 bounds 成 {x1,y1,x2,y2}，兼容 Rect 与 [x,y,w,h] */
-function rectOf (bounds) {
+/**
+ * 当前配置的屏幕尺寸。Automator 内部就是用 config.device_width/device_height
+ * 校验点击范围（越界会抛「点击区域超出屏幕外」），所以点击前统一按这两个值对齐。
+ */
+function screenSpace () {
+  let width = Number(config.device_width)
+  let height = Number(config.device_height)
+  if (!isFinite(width) || width <= 0) {
+    width = 1080
+  }
+  if (!isFinite(height) || height <= 0) {
+    height = 1920
+  }
+  return { width: width, height: height }
+}
+
+/**
+ * 统一 bounds 成 {x1,y1,x2,y2}
+ * 兼容三种来源：Java Rect（left/top/right/bottom）、{left,top,width,height}、数组。
+ * 数组按 [x, y, w, h] 解释，但当「宽/高」超出所在图片范围、而它本身又落在范围内的
+ * 时候，说明给的其实是右下角坐标 [left, top, right, bottom]，按角点重算。
+ *
+ * @param {object} bounds 原始 bounds
+ * @param {object} space  该坐标所属的画布尺寸（截图尺寸或屏幕尺寸）
+ */
+function rectOf (bounds, space) {
   if (!bounds) {
     return null
   }
+  space = space || screenSpace()
   let x1, y1, x2, y2
-  if (typeof bounds.left === 'number') {
-    x1 = bounds.left
-    y1 = bounds.top
-    x2 = bounds.right
-    y2 = bounds.bottom
-  } else if (typeof bounds[0] === 'number' && typeof bounds.length === 'number' && bounds.length >= 4) {
-    x1 = bounds[0]
-    y1 = bounds[1]
-    x2 = x1 + bounds[2]
-    y2 = y1 + bounds[3]
+  if (typeof bounds.left === 'number' && typeof bounds.top === 'number') {
+    if (typeof bounds.right === 'number' && typeof bounds.bottom === 'number') {
+      x1 = bounds.left
+      y1 = bounds.top
+      x2 = bounds.right
+      y2 = bounds.bottom
+    } else if (typeof bounds.width === 'number' && typeof bounds.height === 'number') {
+      x1 = bounds.left
+      y1 = bounds.top
+      x2 = x1 + bounds.width
+      y2 = y1 + bounds.height
+    } else {
+      return null
+    }
+  } else if (typeof bounds.length === 'number' && bounds.length >= 4) {
+    let a = Number(bounds[0])
+    let b = Number(bounds[1])
+    let c = Number(bounds[2])
+    let d = Number(bounds[3])
+    x1 = a
+    y1 = b
+    x2 = a + c
+    y2 = b + d
+    let widthLimit = space.width * 1.05
+    let heightLimit = space.height * 1.05
+    if ((x2 > widthLimit || y2 > heightLimit) && c > a && d > b && c <= widthLimit && d <= heightLimit) {
+      x2 = c
+      y2 = d
+    }
   } else {
+    return null
+  }
+  if (!isFinite(x1) || !isFinite(y1) || !isFinite(x2) || !isFinite(y2)) {
     return null
   }
   if (!(x2 > x1) || !(y2 > y1)) {
@@ -137,8 +196,8 @@ function rectOf (bounds) {
   return { x1: x1, y1: y1, x2: x2, y2: y2 }
 }
 /** 把文本+bounds 包装成统一的节点对象 */
-function nodeOf (text, bounds) {
-  let rect = rectOf(bounds)
+function nodeOf (text, bounds, space) {
+  let rect = rectOf(bounds, space)
   if (!rect) {
     return null
   }
@@ -168,6 +227,7 @@ function SignRunner () {
   this.remainingCount = 0
   this.expandTimes = 0
   this.installedCache = null
+  this.restartTimes = 0
 
   /* ======================== 基础工具 ======================== */
 
@@ -205,46 +265,143 @@ function SignRunner () {
     }
   }
 
+  /**
+   * 唯一的坐标点击出口。
+   * automator.click 会用 config.device_width/device_height 校验范围，越界直接抛
+   * 「点击区域超出屏幕外」；这里先把它规整成屏幕内的整数点，越界时给出越界值
+   * 和来源，方便定位是哪一处坐标算错了。
+   */
+  this.clickPoint = function (x, y, desc) {
+    let space = screenSpace()
+    let nx = Math.round(Number(x))
+    let ny = Math.round(Number(y))
+    if (!isFinite(nx) || !isFinite(ny)) {
+      _this.pushWarningLog('点击坐标非法（' + (desc || '') + '）：' + x + ',' + y)
+      return false
+    }
+    let outX = nx < 0 || nx >= space.width
+    let outY = ny < 0 || ny >= space.height
+    if (outX || outY) {
+      // 只有擦边（超出不超过屏幕 5%）才夹回屏幕内；差太远说明坐标源算错了，宁可跳过
+      let nearX = nx >= -space.width * 0.05 && nx <= space.width * 1.05
+      let nearY = ny >= -space.height * 0.05 && ny <= space.height * 1.05
+      if (!nearX || !nearY) {
+        _this.pushWarningLog('点击坐标超出屏幕，已跳过（' + (desc || '') + '）：' + nx + ',' + ny
+          + ' 屏幕 ' + space.width + 'x' + space.height)
+        return false
+      }
+      let cx = Math.min(Math.max(nx, 1), space.width - 2)
+      let cy = Math.min(Math.max(ny, 2), space.height - 2)
+      logUtils.debugInfo(['越界坐标夹回屏幕内：{},{} -> {},{}', nx, ny, cx, cy])
+      nx = cx
+      ny = cy
+    }
+    try {
+      automator.click(nx, ny)
+      _this.pushLog('点击 ' + (desc || '') + ' (' + nx + ',' + ny + ')')
+      sleep(800)
+      return true
+    } catch (e) {
+      _this.pushWarningLog('点击 ' + (desc || '') + ' 失败：' + e)
+      return false
+    }
+  }
+
+  /**
+   * 点一个控件（UiObject）。控件可能是列表里滚到屏幕外的那一项，bounds 中心点会
+   * 落在屏幕外，所以统一走 clickPoint 校验；坐标不可用时退化成无障碍点击。
+   */
+  this.clickUiObject = function (widget, desc) {
+    if (!widget) {
+      _this.pushWarningLog('未找到可点击控件：' + (desc || ''))
+      return false
+    }
+    let bounds = null
+    try {
+      bounds = widget.bounds()
+    } catch (e) {
+      bounds = null
+    }
+    if (bounds) {
+      if (_this.clickPoint(bounds.centerX(), bounds.centerY(), desc)) {
+        return true
+      }
+    }
+    try {
+      if (typeof widget.click === 'function' && widget.click()) {
+        _this.pushLog('已通过无障碍点击 ' + (desc || widget.text()))
+        sleep(800)
+        return true
+      }
+    } catch (e) {
+      _this.pushWarningLog('无障碍点击 ' + (desc || '') + ' 失败：' + e)
+    }
+    return false
+  }
+
   this.clickNode = function (node, desc) {
     if (!node) {
       _this.pushWarningLog('未找到可点击目标：' + (desc || ''))
       return false
     }
-    try {
-      automator.click(Math.round(node.cx), Math.round(node.cy))
-      _this.pushLog('点击 ' + (desc || node.text) + ' (' + Math.round(node.cx) + ',' + Math.round(node.cy) + ')')
-      sleep(800)
-      return true
-    } catch (e) {
-      _this.pushWarningLog('点击 ' + (desc || node.text) + ' 失败：' + e)
-      return false
-    }
+    return _this.clickPoint(node.cx, node.cy, desc || node.text)
   }
 
   this.clickWidget = function (regex, desc, timeout) {
-    let widget = null
+    let list = []
     try {
-      widget = widgetUtils.widgetGetOne(regex, timeout || 1500, false, true)
+      // 全量找：同一段文字常有一份在屏幕外（横向滚动列表、未展示的页面页签），
+      // widgetGetOne 会随手返回那颗，中心点自然在屏幕外，点了就报越界
+      let found = widgetUtils.widgetGetAll(regex, timeout || 1200, false)
+      if (found) {
+        if (typeof found.forEach === 'function') {
+          found.forEach(function (w) {
+            list.push(w)
+          })
+        } else if (typeof found.size === 'function') {
+          for (let i = 0; i < found.size(); i++) {
+            list.push(found.get(i))
+          }
+        }
+      }
     } catch (e) {
       logUtils.debugInfo(['控件查找失败：{}', e])
     }
-    if (!widget) {
+    if (list.length === 0) {
       return false
     }
-    try {
-      if (automator.checkCenterClickable(widget)) {
-        automator.clickCenter(widget)
-      } else {
-        let bounds = widget.bounds()
-        automator.click(Math.round(bounds.centerX()), Math.round(bounds.centerY()))
+    let space = screenSpace()
+    let visible = 0
+    let target = null
+    list.forEach(function (w) {
+      let bounds = null
+      try {
+        bounds = w.bounds()
+      } catch (e) {
+        bounds = null
       }
-      _this.pushLog('点击 ' + (desc || String(regex)))
-      sleep(800)
-      return true
-    } catch (e) {
-      _this.pushWarningLog('点击 ' + (desc || String(regex)) + ' 失败：' + e)
+      if (!bounds) {
+        return
+      }
+      let cx = bounds.centerX()
+      let cy = bounds.centerY()
+      if (cx < 0 || cy < 0 || cx >= space.width || cy >= space.height) {
+        return
+      }
+      if (bounds.width() <= 0 || bounds.height() <= 0) {
+        return
+      }
+      visible++
+      if (!target) {
+        target = w
+      }
+    })
+    if (!target) {
+      _this.pushWarningLog('「' + (desc || String(regex)) + '」命中 ' + list.length + ' 个控件，但都在屏幕外，已跳过')
       return false
     }
+    logUtils.debugInfo(['「{}」命中 {} 个控件，屏幕内 {} 个', desc || String(regex), list.length, visible])
+    return _this.clickUiObject(target, desc || String(regex))
   }
 
   this.clickRow = function (row, desc) {
@@ -295,6 +452,19 @@ function SignRunner () {
     if (!screen) {
       return []
     }
+    // OCR 返回的是「截图坐标」，屏幕点击用的是「config 屏幕坐标」，两者不一定是同一套
+    let imgWidth = 0
+    let imgHeight = 0
+    try {
+      imgWidth = screen.getWidth()
+      imgHeight = screen.getHeight()
+    } catch (e) {
+      imgWidth = 0
+      imgHeight = 0
+    }
+    let imgSpace = imgWidth > 0 && imgHeight > 0
+      ? { width: imgWidth, height: imgHeight }
+      : screenSpace()
     let finds = []
     try {
       // 不传 region（传 null 在部分 OCR 实现里会当成数组去取下标而报错）
@@ -305,11 +475,28 @@ function SignRunner () {
     }
     let nodes = []
     ;(finds || []).forEach(function (item) {
-      let node = nodeOf(item.label, item.bounds)
+      let node = nodeOf(item.label, item.bounds, imgSpace)
       if (node) {
         nodes.push(node)
       }
     })
+    // 截图分辨率和 config 屏幕尺寸不一致时（折叠屏/分屏/显示缩放），按比例换算回屏幕坐标，
+    // 否则点击坐标会整体偏移甚至越界
+    let space = screenSpace()
+    let sx = imgWidth > 0 ? space.width / imgWidth : 1
+    let sy = imgHeight > 0 ? space.height / imgHeight : 1
+    if (Math.abs(sx - 1) > 0.02 || Math.abs(sy - 1) > 0.02) {
+      logUtils.debugInfo(['截图 {}x{} 与屏幕 {}x{} 不一致，OCR 坐标按 {} / {} 换算',
+        imgWidth, imgHeight, space.width, space.height, sx, sy])
+      nodes.forEach(function (node) {
+        node.x1 = node.x1 * sx
+        node.x2 = node.x2 * sx
+        node.cx = node.cx * sx
+        node.y1 = node.y1 * sy
+        node.y2 = node.y2 * sy
+        node.cy = node.cy * sy
+      })
+    }
     return nodes
   }
 
@@ -369,7 +556,7 @@ function SignRunner () {
    */
   this.isHomepage = function (nodes) {
     nodes = nodes || _this.readNodes()
-    let height = config.device_height
+    let height = screenSpace().height
     let bottomHas = function (label) {
       return _this.matches(nodes, new RegExp(label)).some(function (node) {
         return node.cy > height * 0.8
@@ -401,8 +588,8 @@ function SignRunner () {
    * 答题/邀请/抢购这类点进去只是开个页面、不能自动完成，排除掉免得白跑。
    */
   this.blindClickButtons = function (nodes) {
-    let width = config.device_width
-    let height = config.device_height
+    let width = screenSpace().width
+    let height = screenSpace().height
     let buttons = []
     _this.actionButtons(nodes).forEach(function (node) {
       if (node.cx < width * 0.5) {
@@ -426,33 +613,294 @@ function SignRunner () {
   /* ======================== 启动与导航 ======================== */
 
   /**
-   * 启动/跳转时可能出现「打开 / 仅本次 / 允许」确认窗
+   * 启动/跳转时可能出现「打开 / 仅本次 / 允许」确认窗。
+   * daily.py launch_confirmation 的判据：先认场景（启动应用/链接提示/正在离开…），
+   * 再在场景内选一次性允许，并明确避开「始终允许」。
    */
-  this.handleJumpDialog = function () {
-    let handled = false
-    ;['^打开$', '^仅本次$', '^仅打开一次$', '^允许$', '^打开应用$', '^继续前往$', '^仍要打开$'].forEach(function (pattern) {
-      if (_this.clickWidget(pattern, '跳转确认 ' + pattern, 1200)) {
-        handled = true
+  this.handleJumpDialog = function (nodes) {
+    nodes = nodes || _this.readNodes()
+    if (!_this.hasText(nodes, JUMP_SCENE_TEXT)) {
+      return false
+    }
+    let allow = null
+    _this.matches(nodes, JUMP_ALLOW_TEXT).forEach(function (node) {
+      if (!allow && !JUMP_DENY_TEXT.test(clean(node.text))) {
+        allow = node
       }
     })
-    return handled
-  }
-
-  this.launchTaobao = function () {
-    _this.pushLog('打开淘宝')
+    if (allow) {
+      return _this.clickNode(allow, '跳转确认 ' + clean(allow.text))
+    }
+    let widget = null
     try {
-      commonFunctions.launchPackage(PACKAGE_NAME)
+      widget = widgetUtils.widgetGetOne(JUMP_ALLOW_TEXT.source, 800)
     } catch (e) {
+      logUtils.debugInfo(['查找跳转确认按钮失败：{}', e])
+    }
+    if (widget) {
+      let text = ''
       try {
-        app.launch(PACKAGE_NAME)
-      } catch (e2) {
-        _this.pushWarningLog('启动淘宝失败：' + e2)
+        text = widget.text() || ''
+      } catch (e) {
+        text = ''
+      }
+      if (!JUMP_DENY_TEXT.test(clean(text))) {
+        return _this.clickUiObject(widget, '跳转确认 ' + text)
       }
     }
-    sleep(2500)
-    _this.handleJumpDialog()
-    sleep(1200)
-    return _this.isInTaobao()
+    return false
+  }
+
+  /**
+   * 轮询等待当前前台应用变成指定包名（刚启动时可能先读到桌面）
+   */
+  this.waitCurrentPackage = function (pkg, timeout) {
+    let deadline = new Date().getTime() + (timeout || 3000)
+    while (new Date().getTime() < deadline) {
+      try {
+        if (commonFunctions.myCurrentPackage() == pkg) {
+          return true
+        }
+      } catch (e) {
+        // 忽略
+      }
+      sleep(300)
+    }
+    return false
+  }
+
+  /**
+   * 多种手段把淘宝拉到前台（不做重启），每步校验包名。
+   * 不用 app.launchApp（按应用名启动会抛异常把整轮打死），最后一步用 MAIN/LAUNCHER intent。
+   */
+  this.tryLaunchTaobao = function (purpose) {
+    let ptag = purpose ? '（' + purpose + '）' : ''
+    let names = ['框架launchPackage', 'app.launch', 'MAIN/LAUNCHER intent']
+    let tries = [
+      function () {
+        commonFunctions.launchPackage(PACKAGE_NAME)
+      },
+      function () {
+        if (typeof app.launch === 'function') {
+          app.launch(PACKAGE_NAME)
+        }
+      },
+      function () {
+        app.startActivity({
+          action: 'android.intent.action.MAIN',
+          category: 'android.intent.category.LAUNCHER',
+          packageName: PACKAGE_NAME,
+          flags: 0x10000000
+        })
+      }
+    ]
+    for (let i = 0; i < tries.length; i++) {
+      if (!_this.withinBudget()) {
+        return false
+      }
+      try {
+        tries[i]()
+        _this.pushLog('启动淘宝' + ptag + '：' + names[i])
+      } catch (e) {
+        _this.pushWarningLog('启动淘宝失败' + ptag + '（' + names[i] + '）：' + e)
+        continue
+      }
+      if (_this.waitCurrentPackage(PACKAGE_NAME, i === 0 ? 3000 : 2500)) {
+        sleep(1200)
+        _this.handleJumpDialog()
+        return _this.isInTaobao()
+      }
+      _this.pushWarningLog('启动后仍未进入淘宝' + ptag + '（' + names[i] + '）')
+    }
+    return false
+  }
+
+  /**
+   * 通过系统「应用信息」页点击「结束运行 / 强行停止」关掉淘宝（无 root 可用）。
+   * 流程与 Yunbaobao.forceStopByAppSettings 一致：应用详情页 → 找停止按钮 → 点 → 找确定 → 返回。
+   */
+  this.forceStopTaobao = function () {
+    let backSafely = function () {
+      try {
+        automator.back()
+      } catch (e) {
+        // 忽略
+      }
+    }
+    let stopNames = ['强行停止', '结束运行', '强制停止', '停止运行']
+    let buttonIds = ['vbutton_title', 'com.android.settings:id/vbutton_title']
+    let findStopBtn = function () {
+      for (let k = 0; k < buttonIds.length; k++) {
+        for (let i = 0; i < stopNames.length; i++) {
+          try {
+            let el = selector().id(buttonIds[k]).textContains(stopNames[i]).findOne(200)
+            if (el) {
+              return { node: el, name: stopNames[i] }
+            }
+          } catch (e) {
+            // 忽略
+          }
+        }
+      }
+      for (let i = 0; i < stopNames.length; i++) {
+        try {
+          let el = textContains(stopNames[i]).findOnce()
+          if (el && el.text() && el.text().indexOf('停止') >= 0) {
+            return { node: el, name: el.text() }
+          }
+        } catch (e) {
+          // 忽略
+        }
+      }
+      return null
+    }
+    let findConfirm = function () {
+      // 不要用裸「停止」，否则会命中页面上的「强行停止」按钮本身
+      let names = ['确定', '确定停止']
+      for (let i = 0; i < names.length; i++) {
+        try {
+          let el = text(names[i]).findOnce()
+          if (el) {
+            return el
+          }
+        } catch (e) {
+          // 忽略
+        }
+      }
+      try {
+        let el = selector().id('android:id/button1').findOne(300)
+        if (el && el.text() && /确定|停止/.test(el.text())) {
+          return el
+        }
+      } catch (e) {
+        // 忽略
+      }
+      return null
+    }
+    try {
+      _this.pushLog('打开淘宝应用信息页，准备强制停止')
+      app.openAppSetting(PACKAGE_NAME)
+      sleep(2000)
+      let found = null
+      let start = new Date().getTime()
+      while (!found && new Date().getTime() - start < 6000) {
+        found = findStopBtn()
+        if (!found) {
+          sleep(300)
+        }
+      }
+      if (!found) {
+        // 首屏没有就滚动一屏再找（有的机型按钮在页面下方）
+        try {
+          let sv = scrollable().findOnce()
+          if (sv) {
+            sv.scrollForward()
+          }
+        } catch (e) {
+          // 忽略
+        }
+        sleep(800)
+        start = new Date().getTime()
+        while (!found && new Date().getTime() - start < 5000) {
+          found = findStopBtn()
+          if (!found) {
+            sleep(300)
+          }
+        }
+      }
+      if (!found) {
+        _this.pushWarningLog('应用信息页未找到「结束运行/强行停止」按钮')
+        _this.logVisibleTexts('应用信息页')
+        backSafely()
+        return false
+      }
+      let stopped = false
+      for (let attempt = 0; attempt < 3 && !stopped; attempt++) {
+        _this.pushLog('点击「' + found.name + '」（第' + (attempt + 1) + '次）')
+        _this.clickUiObject(found.node, found.name)
+        sleep(900)
+        let confirm = findConfirm()
+        if (confirm) {
+          _this.pushLog('确认弹窗点击「' + (confirm.text() || '确定') + '」')
+          _this.clickUiObject(confirm, '停止确认')
+          sleep(900)
+          // 个别机型确认后还有第二层确认
+          let confirm2 = findConfirm()
+          if (confirm2) {
+            _this.clickUiObject(confirm2, '停止二次确认')
+            sleep(800)
+          }
+          stopped = true
+          break
+        }
+        let again = findStopBtn()
+        if (!again) {
+          stopped = true
+          break
+        }
+        let enabled = true
+        try {
+          enabled = again.node.enabled()
+        } catch (e) {
+          enabled = true
+        }
+        if (!enabled) {
+          _this.pushLog('「' + again.name + '」已变为不可点击，判定已停止')
+          stopped = true
+          break
+        }
+        found = again
+        sleep(600)
+      }
+      if (!stopped) {
+        _this.pushWarningLog('多次点击「' + found.name + '」仍未确认停止')
+      }
+      _this.pushLog('已执行「' + found.name + '」关闭淘宝')
+      backSafely()
+      sleep(700)
+      return true
+    } catch (e) {
+      _this.pushWarningLog('应用信息页关闭淘宝异常：' + e)
+      backSafely()
+      return false
+    }
+  }
+
+  /**
+   * 重启淘宝：强制停止进程后重新打开。只在单次执行内做有限次，
+   * 避免「失败-重启-再失败」把整轮时间吃光。
+   */
+  this.restartTaobao = function (purpose) {
+    if (_this.restartTimes >= OPTIONS.maxRestarts) {
+      _this.pushWarningLog('本次执行已重启淘宝 ' + _this.restartTimes + ' 次，不再重启')
+      return _this.isInTaobao()
+    }
+    _this.restartTimes++
+    _this.pushWarningLog('重启淘宝（第 ' + _this.restartTimes + ' 次）：强制停止后重新打开')
+    try {
+      _this.forceStopTaobao()
+      sleep(1200)
+      let ok = _this.tryLaunchTaobao(purpose || '重启后')
+      if (ok) {
+        _this.pushLog('重启淘宝成功')
+      } else {
+        _this.pushWarningLog('重启淘宝仍失败（当前包：' + _this.currentPackage() + '）')
+      }
+      return ok
+    } catch (e) {
+      _this.pushWarningLog('重启淘宝异常：' + e)
+      return false
+    }
+  }
+
+  /**
+   * 确保淘宝在前台：先正常拉起，全部手段都失败才重启
+   */
+  this.launchTaobao = function (purpose) {
+    if (_this.tryLaunchTaobao(purpose)) {
+      return true
+    }
+    return _this.restartTaobao(purpose)
   }
 
   /**
@@ -478,25 +926,11 @@ function SignRunner () {
    * 点首页频道里的「领淘金币 / 淘金币」入口（控件优先，OCR 兜底）
    */
   this.tapCoinEntry = function (nodes) {
-    let widget = null
-    try {
-      widget = widgetUtils.widgetGetOne(/^(?:去|进入|领|领一下)?淘金币[>〉]?$/, 2000, false, true)
-    } catch (e) {
-      logUtils.debugInfo(['查找淘金币入口控件失败：{}', e])
+    if (_this.clickWidget(/^(?:去|进入|领|领一下)?淘金币[>〉]?$/, '首页频道「淘金币」', 2000)) {
+      return true
     }
-    if (widget) {
-      try {
-        let bounds = widget.bounds()
-        automator.click(Math.round(bounds.centerX()), Math.round(bounds.centerY()))
-        _this.pushLog('点击首页频道「' + (widget.text() || '淘金币') + '」')
-        sleep(1000)
-        return true
-      } catch (e) {
-        _this.pushWarningLog('点击淘金币频道失败：' + e)
-      }
-    }
-    let width = config.device_width
-    let height = config.device_height
+    let width = screenSpace().width
+    let height = screenSpace().height
     let candidates = []
     _this.matches(nodes || _this.readNodes(), /^(?:去|进入|领|领一下)?淘金币[>〉]?$/).forEach(function (node) {
       // 避开状态栏与底部导航，商品标题里也可能出现淘金币
@@ -517,41 +951,122 @@ function SignRunner () {
     return false
   }
 
-  this.inputKeyword = function (keyword) {
+  /**
+   * 搜索页的输入框（search.py search_edit）：优先带焦点的 EditText，
+   * 只有一个 EditText 时才认；多个且都没焦点时不猜，免得往隐藏框里写字。
+   */
+  this.searchEdit = function () {
     try {
-      let edit = className('android.widget.EditText').findOne(1500)
-      if (edit) {
-        edit.setText(keyword)
-        _this.pushLog('输入关键词：' + keyword)
-        sleep(600)
-        return true
+      let focused = className('android.widget.EditText').focused(true).findOne(600)
+      if (focused) {
+        return focused
       }
     } catch (e) {
-      logUtils.debugInfo(['查找搜索输入框失败：{}', e])
+      logUtils.debugInfo(['查找聚焦输入框失败：{}', e])
+    }
+    try {
+      let list = []
+      className('android.widget.EditText').find().forEach(function (view) {
+        list.push(view)
+      })
+      if (list.length === 1) {
+        return list[0]
+      }
+      if (list.length > 1) {
+        logUtils.debugInfo(['搜索页有 {} 个输入框且都没有焦点，不猜', list.length])
+      }
+    } catch (e) {
+      logUtils.debugInfo(['枚举输入框失败：{}', e])
+    }
+    return null
+  }
+
+  this.waitSearchEdit = function (timeout) {
+    let end = new Date().getTime() + (timeout || 6000)
+    while (new Date().getTime() < end) {
+      let edit = _this.searchEdit()
+      if (edit) {
+        return edit
+      }
+      sleep(500)
+    }
+    return null
+  }
+
+  /**
+   * 往搜索框写关键词（search.py fill_search_field + handle_search）：
+   * 已经就是目标词就不重复写；写完一定读回来确认，读回不来再用 setText(0, …) 兜底。
+   * 这就是「写了淘金币却没确认」的根：原来写完不做校验，键盘一刷新输入框换了个实例。
+   */
+  this.fillSearchField = function (keyword) {
+    if (!_this.isInTaobao()) {
+      _this.pushWarningLog('当前不在淘宝，停止输入关键词')
+      return false
+    }
+    let edit = _this.waitSearchEdit(4000)
+    if (!edit) {
+      _this.pushWarningLog('搜索页没有可确认的输入框，不输入关键词')
+      return false
+    }
+    let target = clean(keyword)
+    let current = ''
+    try {
+      current = clean(edit.text())
+    } catch (e) {
+      current = ''
+    }
+    if (current === target) {
+      _this.pushLog('输入框已是「' + keyword + '」，不重复输入')
+      return true
+    }
+    for (let i = 0; i < 2; i++) {
+      try {
+        edit.setText(keyword)
+      } catch (e) {
+        _this.pushWarningLog('写入关键词失败（第 ' + (i + 1) + ' 次）：' + e)
+      }
+      sleep(500)
+      let after = _this.searchEdit()
+      let got = ''
+      try {
+        got = after ? clean(after.text()) : ''
+      } catch (e) {
+        got = ''
+      }
+      if (got && got.indexOf(target) >= 0) {
+        _this.pushLog('输入关键词：' + keyword)
+        return true
+      }
+      edit = after || edit
     }
     try {
       setText(0, keyword)
-      _this.pushLog('输入关键词（无输入框兜底）：' + keyword)
       sleep(600)
-      return true
+      let after = _this.searchEdit()
+      if (after && clean(after.text()).indexOf(target) >= 0) {
+        _this.pushLog('输入关键词（setText 兜底）：' + keyword)
+        return true
+      }
     } catch (e) {
-      _this.pushWarningLog('输入关键词失败：' + e)
+      logUtils.debugInfo(['setText 兜底失败：{}', e])
     }
+    _this.pushWarningLog('关键词写入后没有读回，按未填写处理')
     return false
   }
 
   /**
-   * 提交搜索：只认右上角那个窄的「搜索」按钮（search.py _submit_buttons）
+   * 提交按钮只认右上角那个窄的「搜索」（search.py _submit_buttons）：
+   * 中心 x > 0.7 屏宽、0 < y < 0.25 屏高、宽度 < 0.3 屏宽
    */
-  this.submitSearch = function () {
-    let width = config.device_width
-    let height = config.device_height
+  this.submitButtons = function (nodes) {
+    let width = screenSpace().width
+    let height = screenSpace().height
     let buttons = []
-    _this.readNodes().forEach(function (node) {
+    ;(nodes || []).forEach(function (node) {
       if (clean(node.text) !== '搜索') {
         return
       }
-      if (node.cx < width * 0.6 || node.cy > height * 0.25) {
+      if (node.cx < width * 0.7 || node.cy >= height * 0.25) {
         return
       }
       if (node.x2 - node.x1 >= width * 0.3) {
@@ -559,61 +1074,185 @@ function SignRunner () {
       }
       buttons.push(node)
     })
-    if (buttons.length > 0) {
-      buttons.sort(function (a, b) {
-        return b.cx - a.cx
-      })
-      return _this.clickNode(buttons[0], '提交搜索')
+    buttons.sort(function (a, b) {
+      return b.cx - a.cx
+    })
+    return buttons
+  }
+
+  /** 硬件回车提交（AutoJS 无输入法时它不经过 IME 的「搜索」键） */
+  this.pressEnter = function () {
+    try {
+      KeyCode('KEYCODE_ENTER')
+      return true
+    } catch (e) {
+      logUtils.debugInfo(['KeyCode 回车失败：{}', e])
     }
-    return _this.clickWidget('^搜索$', '提交搜索（控件兜底）', 1500)
+    try {
+      shell('input keyevent 66', true)
+      return true
+    } catch (e2) {
+      logUtils.debugInfo(['input keyevent 66 失败：{}', e2])
+    }
+    return false
   }
 
   /**
-   * 首页找不到入口时用搜索兜底：搜索「淘金币」→ 结果里的官方频道卡片 → 落地页
+   * 提交搜索并确认结果（search.py handle_search）：
+   * 最多点两次搜索按钮，第三次改用回车；每次提交后重新读屏判断结果页，
+   * 只有 readyFn 认了才返回 true。原来「点了搜索就 sleep 2.5s 然后开始翻页面」
+   * 的写法在按钮被键盘挡住/页面还在动画时会一直卡在搜索页。
    */
-  this.openCoinBySearch = function () {
-    let width = config.device_width
-    let height = config.device_height
-    _this.pushLog('首页未找到淘金币入口，改用搜索进入')
-    let nodes = _this.readNodes()
-    let box = null
-    _this.matches(nodes, /^搜索栏$|^搜索框$|^搜索宝贝$|^搜索商品$|^搜索$/).forEach(function (node) {
-      if (node.cy > height * 0.25 || node.cx > width * 0.8) {
+  this.submitSearch = function (readyFn, budgetSeconds) {
+    let budget = budgetSeconds || OPTIONS.searchBudgetSeconds
+    let deadline = new Date().getTime() + budget * 1000
+    let submits = 0
+    while (new Date().getTime() < deadline && _this.withinBudget()) {
+      if (!_this.isInTaobao()) {
+        _this.pushWarningLog('搜索过程中已离开淘宝，停止提交')
+        return false
+      }
+      let nodes = _this.readNodes()
+      if (readyFn && readyFn(nodes)) {
+        return true
+      }
+      if (submits < 2) {
+        let buttons = _this.submitButtons(nodes)
+        if (buttons.length > 0) {
+          _this.clickNode(buttons[0], '提交搜索（第 ' + (submits + 1) + ' 次）')
+        } else {
+          _this.pushWarningLog('没有定位到搜索按钮，改用回车提交')
+          _this.pressEnter()
+        }
+        submits++
+      } else if (submits === 2) {
+        _this.pushLog('两次点按钮仍未确认结果，改用回车提交')
+        _this.pressEnter()
+        submits++
+      }
+      sleep(3000)
+    }
+    let last = _this.readNodes()
+    let ok = !!(readyFn && readyFn(last))
+    if (!ok) {
+      _this.pushWarningLog('搜索提交后仍未确认结果页')
+    }
+    return ok
+  }
+
+  /** 搜索结果里露在首屏的官方淘金币入口（避开商品标题与底部导航） */
+  this.coinEntryNodes = function (nodes) {
+    let width = screenSpace().width
+    let height = screenSpace().height
+    let hits = []
+    _this.matches(nodes, /^(?:去|进入|领|领一下|打开)?淘金币[>〉]?$/).forEach(function (node) {
+      if (node.cy < height * 0.08 || node.cy > height * 0.45) {
         return
       }
-      if (!box || node.cy < box.cy) {
-        box = node
-      }
-    })
-    if (box) {
-      _this.clickNode(box, '首页搜索框')
-    } else if (!_this.clickWidget(/^搜索栏$|^搜索框$/, '首页搜索框（控件兜底）', 1500)) {
-      return false
-    }
-    sleep(1500)
-    if (!_this.inputKeyword(KEYWORD_ENTRY)) {
-      return false
-    }
-    _this.submitSearch()
-    sleep(2500)
-    // 结果页里的官方频道卡片：领淘金币 / 淘金币
-    let results = _this.readNodes()
-    let cards = []
-    _this.matches(results, /^(?:去|进入|领|领一下)?淘金币[>〉]?$/).forEach(function (node) {
-      if (node.cy > height * 0.45) {
+      if (node.cx < width * 0.05 || node.cx > width * 0.95) {
         return
       }
-      cards.push(node)
+      hits.push(node)
     })
-    if (cards.length === 0) {
-      _this.pushWarningLog('搜索结果里没有找到淘金币入口')
-      return false
-    }
-    cards.sort(function (a, b) {
+    hits.sort(function (a, b) {
       return a.cy - b.cy
     })
-    _this.clickNode(cards[0], '搜索结果淘金币入口')
-    sleep(2500)
+    return hits
+  }
+
+  /** 商品搜索结果页判据（search.py search_results_ready） */
+  this.searchResultsReady = function (nodes) {
+    if (!nodes || nodes.length < 6) {
+      return false
+    }
+    if (_this.hasText(nodes, /历史搜索|搜索发现|猜你想搜|搜索推荐/)) {
+      // 还挂着搜索历史/推荐 = 仍然停留在搜索页（search.py 的第一条判据）
+      return false
+    }
+    let filters = 0
+    ;[/^综合/, /^销量/, /^筛选/, /^店铺/, /^价格/].forEach(function (pattern) {
+      if (_this.hasText(nodes, pattern)) {
+        filters++
+      }
+    })
+    if (filters >= 2 && nodes.length >= 8) {
+      return true
+    }
+    // 大促的搜索页没有排序工具栏，只有「浏览N秒」横幅 + 商品格
+    let height = screenSpace().height
+    let banner = _this.hasText(nodes, /浏览[0-9]+[秒sS](?:可领|可得)|浏览完成.*(?:奖励|能量)/)
+    let search = _this.matches(nodes, /^搜索$/).some(function (node) {
+      return node.cy < height * 0.25
+    })
+    let products = 0
+    nodes.forEach(function (node) {
+      if (/[¥￥]\s*[0-9]|金币热卖价|金币已抵/.test(clean(node.text))) {
+        products++
+      }
+    })
+    return banner && search && products >= 2
+  }
+
+  /**
+   * 首页找不到入口时用搜索兜底：搜索「淘金币」→ 确认官方入口出现 → 点进去。
+   * 任何一步没确认就不往下走，交给上层换路子（而不是在搜索页里瞎找）。
+   */
+  this.openCoinBySearch = function () {
+    let width = screenSpace().width
+    let height = screenSpace().height
+    _this.pushLog('首页未找到淘金币入口，改用搜索进入')
+    if (!_this.isInTaobao()) {
+      _this.pushWarningLog('不在淘宝，无法用搜索进入淘金币')
+      return false
+    }
+    // 1. 打开搜索页：点首页搜索框，然后等「真正的输入框」出现
+    let edit = _this.searchEdit()
+    if (!edit) {
+      let nodes = _this.readNodes()
+      let box = null
+      _this.matches(nodes, /^搜索栏$|^搜索框$|^搜索宝贝$|^搜索商品$|^搜索$/).forEach(function (node) {
+        if (node.cy > height * 0.25 || node.cx > width * 0.8) {
+          return
+        }
+        if (!box || node.cy < box.cy) {
+          box = node
+        }
+      })
+      if (box) {
+        _this.clickNode(box, '首页搜索框')
+      } else if (!_this.clickWidget(/^搜索栏$|^搜索框$/, '首页搜索框（控件兜底）', 1500)) {
+        _this.pushWarningLog('首页没有可点的搜索框')
+        return false
+      }
+      sleep(1200)
+      edit = _this.waitSearchEdit(6000)
+    }
+    if (!edit) {
+      _this.pushWarningLog('点了搜索框但没等到输入框，放弃搜索进入')
+      return false
+    }
+    // 2. 写关键词并读回确认
+    if (!_this.fillSearchField(KEYWORD_ENTRY)) {
+      return false
+    }
+    // 3. 提交并确认「官方淘金币入口」真的出来了
+    let ready = function (list) {
+      return _this.coinEntryNodes(list).length > 0 || _this.isCoinLanding(list) || _this.isTaskPanel(list)
+    }
+    if (!_this.submitSearch(ready, OPTIONS.searchBudgetSeconds)) {
+      _this.pushWarningLog('搜索「' + KEYWORD_ENTRY + '」后未确认到淘金币入口')
+      return false
+    }
+    let nodes = _this.readNodes()
+    if (_this.isTaskPanel(nodes) || _this.isCoinLanding(nodes)) {
+      return true
+    }
+    let hits = _this.coinEntryNodes(nodes)
+    if (hits.length === 0) {
+      return false
+    }
+    _this.clickNode(hits[0], '搜索结果淘金币入口')
+    sleep(2000)
     return true
   }
 
@@ -755,26 +1394,38 @@ function SignRunner () {
    * 展开过一次之后按钮会变成「收起」，再点会把露出来的任务重新折叠，所以限次数。
    */
   this.expandPanel = function (nodes) {
-    if (_this.expandTimes >= OPTIONS.maxExpandTimes) {
-      return false
-    }
     nodes = nodes || _this.readNodes()
     if (!_this.isTaskPanel(nodes)) {
       return false
     }
-    let expand = _this.matches(nodes, /^展开[⌄⌃^＞>〉·.]*$/)
-    if (expand.length === 0) {
-      return false
+    let before = _this.parseTasks(nodes).length
+    // daily.py ensure_expanded：点一次不算数，要等任务真的画出来；没画出来再点一次
+    for (let attempt = 0; attempt < 2; attempt++) {
+      if (_this.expandTimes >= OPTIONS.maxExpandTimes) {
+        return false
+      }
+      let expand = _this.matches(nodes, /^展开[⌄⌃^＞>〉·.]*$/)
+      if (expand.length === 0) {
+        // 按钮已经不在：要么已经展开（变成「收起」），要么这一版没有展开
+        return false
+      }
+      _this.expandTimes++
+      _this.pushLog('展开全部任务（第 ' + _this.expandTimes + ' 次）')
+      _this.clickNode(expand[0], '展开任务列表')
+      sleep(1800)
+      nodes = _this.readNodes()
+      if (_this.parseTasks(nodes).length > before) {
+        return true
+      }
+      if (!_this.isTaskPanel(nodes)) {
+        return true
+      }
     }
-    _this.expandTimes++
-    _this.pushLog('展开全部任务（第 ' + _this.expandTimes + ' 次）')
-    _this.clickNode(expand[0], '展开任务列表')
-    sleep(1800)
     return true
   }
 
   this.findCloseNode = function (nodes) {
-    let height = config.device_height
+    let height = screenSpace().height
     let closes = _this.matches(nodes, POPUP_CLOSE_TEXT)
     for (let i = 0; i < closes.length; i++) {
       let node = closes[i]
@@ -819,8 +1470,8 @@ function SignRunner () {
    * （daily.py install_swipe_guard 的分段滑动）。这里统一控制在 0.12 屏高以内。
    */
   this.shortScroll = function (up) {
-    let width = config.device_width
-    let height = config.device_height
+    let width = screenSpace().width
+    let height = screenSpace().height
     let x = Math.round(width * 0.5)
     let step = Math.round(height * 0.12)
     let from = Math.round(height * 0.62)
@@ -841,13 +1492,33 @@ function SignRunner () {
   }
 
   /**
+   * 把面板滚回顶部（daily.py reset_list_scroll）：
+   * 上一轮滑到底之后，首屏的任务行会被滚出视野，下次进来会漏掉它们。
+   */
+  this.resetPanelScroll = function () {
+    let width = screenSpace().width
+    let height = screenSpace().height
+    let x = Math.round(width * 0.5)
+    for (let i = 0; i < 4; i++) {
+      try {
+        automator.swipe(x, Math.round(height * 0.35), x, Math.round(height * 0.8), 400)
+      } catch (e) {
+        logUtils.debugInfo(['回滚面板失败：{}', e])
+        return
+      }
+      sleep(500)
+    }
+    _this.pushLog('任务面板已滚回顶部')
+  }
+
+  /**
    * 在面板里往下找更多任务。滑完已经不是面板了（浮层被关掉）就返回 false，
    * 交给上层重新进页面。
    */
   this.scrollPanel = function () {
     let beforeSig = _this.panelSignature(_this.readNodes())
-    let width = config.device_width
-    let height = config.device_height
+    let width = screenSpace().width
+    let height = screenSpace().height
     let x = Math.round(width * 0.5)
     let step = Math.round(height * 0.15)
     let from = Math.round(height * 0.78)
@@ -903,8 +1574,8 @@ function SignRunner () {
    * 找出按钮左侧同一行里的标题和小字（caption / 浏览5秒 这类描述）
    */
   this.captionNodes = function (nodes, anchor) {
-    let width = config.device_width
-    let height = config.device_height
+    let width = screenSpace().width
+    let height = screenSpace().height
     let left = []
     nodes.forEach(function (node) {
       if (!chinese(node.text)) {
@@ -1049,8 +1720,8 @@ function SignRunner () {
    */
   this.parseTasks = function (nodes) {
     nodes = nodes || _this.readNodes()
-    let width = config.device_width
-    let height = config.device_height
+    let width = screenSpace().width
+    let height = screenSpace().height
     let rows = []
     let seen = {}
 
@@ -1165,8 +1836,8 @@ function SignRunner () {
   }
 
   this.productCards = function (nodes) {
-    let width = config.device_width
-    let height = config.device_height
+    let width = screenSpace().width
+    let height = screenSpace().height
     let cards = []
     nodes.forEach(function (node) {
       // coins/config.json product_markers
@@ -1185,7 +1856,7 @@ function SignRunner () {
   }
 
   this.voiceChips = function (nodes) {
-    let height = config.device_height
+    let height = screenSpace().height
     let skip = /^搜索$|^取消$|^返回$|^语音$|^语音搜索$|^按住.{0,6}说$|^说点什么$|^历史搜索$|^搜索发现$|^猜你想搜$|^换一换$|^换一批$|^清空$|^关闭$|^[Xx×✕]$/
     let chips = []
     nodes.forEach(function (node) {
@@ -1295,6 +1966,43 @@ function SignRunner () {
     return installed
   }
 
+  /**
+   * 跳到目标应用后确认「页面真的有内容」（daily.py destination_ready）：
+   * 只认 10%~97% 高度上、≥2 个中文文本节点，状态栏/空白不算到货。
+   * 还在淘宝就顺手把冒出来的跳转确认框处理掉（最多两次确认）。
+   */
+  this.waitDestination = function (timeout) {
+    let height = screenSpace().height
+    let end = new Date().getTime() + (timeout || OPTIONS.destinationTimeoutSeconds) * 1000
+    while (new Date().getTime() < end) {
+      if (_this.isInTaobao()) {
+        if (_this.handleJumpDialog(_this.readNodes())) {
+          sleep(1200)
+          continue
+        }
+        sleep(600)
+        continue
+      }
+      let nodes = _this.readNodes()
+      let content = 0
+      nodes.forEach(function (node) {
+        let text = clean(node.text)
+        if (text.length < 2 || !chinese(text)) {
+          return
+        }
+        if (node.cy < height * 0.1 || node.cy > height * 0.97) {
+          return
+        }
+        content++
+      })
+      if (content >= 2) {
+        return true
+      }
+      sleep(800)
+    }
+    return false
+  }
+
   this.executeVisit = function (row) {
     let packages = APP_PACKAGES[row.app] || []
     if (_this.isAppInstalled(packages) === false) {
@@ -1304,14 +2012,24 @@ function SignRunner () {
     _this.clickRow(row, '跳转 ' + row.app)
     sleep(1500)
     _this.handleJumpDialog()
-    sleep(1500)
-    _this.handleJumpDialog()
-    if (_this.isInTaobao()) {
-      let nodes = _this.readNodes()
-      if (_this.isTaskPanel(nodes)) {
-        _this.pushWarningLog('没有离开任务面板，跳转未生效')
+    if (_this.isInTaobao() && _this.isTaskPanel(_this.readNodes())) {
+      // daily.py：两次确认仍未离开面板就算这个任务这次做不了，只跳过它自己
+      _this.handleJumpDialog()
+      if (_this.isTaskPanel(_this.readNodes())) {
+        _this.pushWarningLog('两次确认后仍停留在任务面板，跳转未生效，本次跳过该任务')
         return false
       }
+    }
+    if (!_this.waitDestination()) {
+      _this.pushWarningLog('目标应用 ' + (row.app || '') + ' 没有加载出页面内容，本次跳过该任务')
+      if (!_this.isInTaobao()) {
+        automator.back()
+        sleep(1500)
+      }
+      if (!_this.isInTaobao()) {
+        _this.launchTaobao()
+      }
+      return false
     }
     _this.stayOnPage(row.seconds || OPTIONS.defaultVisitSeconds)
     if (!_this.isInTaobao()) {
@@ -1393,25 +2111,39 @@ function SignRunner () {
       _this.pushWarningLog('点击后仍停留在任务面板')
       return false
     }
+    let confirmed = false
+    let resultsReady = function (list) {
+      return _this.searchResultsReady(list)
+    }
     // 语音搜索页点一个分类就能进结果页，不需要真的说话（daily.py handle_search）
     if (_this.hasText(nodes, /语音搜索|语音得金币|按住.{0,6}说|说点什么/)) {
       let chips = _this.voiceChips(nodes)
       if (chips.length > 0) {
         _this.clickNode(chips[0], '语音搜索分类')
         sleep(2500)
+        confirmed = resultsReady(_this.readNodes())
       } else {
         _this.pushWarningLog('语音搜索页没有找到可点的分类')
       }
+      if (!confirmed) {
+        if (_this.fillSearchField(KEYWORD_TASK)) {
+          confirmed = _this.submitSearch(resultsReady, OPTIONS.searchBudgetSeconds)
+        }
+      }
     } else {
-      if (_this.inputKeyword(KEYWORD_TASK)) {
-        _this.submitSearch()
-        sleep(2500)
+      if (_this.fillSearchField(KEYWORD_TASK)) {
+        confirmed = _this.submitSearch(resultsReady, OPTIONS.searchBudgetSeconds)
+      }
+      if (!confirmed) {
+        _this.pushWarningLog('搜索任务未确认进入商品结果页')
       }
     }
-    _this.stayOnPage(6)
+    if (confirmed) {
+      _this.stayOnPage(OPTIONS.searchStaySeconds)
+    }
     automator.back()
     sleep(1500)
-    return true
+    return confirmed
   }
 
   this.executeClickProducts = function (row) {
@@ -1482,6 +2214,7 @@ function SignRunner () {
     let rounds = 0
     let stall = 0
     let blocked = {}
+    _this.expandTimes = 0
     while (_this.withinBudget() && rounds < OPTIONS.maxRounds) {
       rounds++
       if (!_this.isInTaobao()) {
@@ -1556,6 +2289,7 @@ function SignRunner () {
           if (stall >= 2) {
             _this.noMoreTasks = true
             _this.pushLog('面板已经没有可执行任务了')
+            _this.resetPanelScroll()
             break
           }
           stall++
@@ -1602,27 +2336,18 @@ function SignRunner () {
     }
     let deadline = new Date().getTime() + 45000
     _this.pushLog('可选步骤：88VIP 每日签到')
-    let entry = null
-    try {
-      entry = widgetUtils.widgetGetOne(/^88VIP$|^88VIP[>〉]?$/, 1500, false, true)
-    } catch (e) {
-      logUtils.debugInfo(['查找88VIP入口失败：{}', e])
-    }
-    if (entry) {
-      try {
-        let bounds = entry.bounds()
-        automator.click(Math.round(bounds.centerX()), Math.round(bounds.centerY()))
-        _this.pushLog('点击 88VIP 入口')
-      } catch (e) {
-        _this.pushWarningLog('点击88VIP入口失败：' + e)
-      }
-    } else {
+    let clicked = _this.clickWidget(/^88VIP$|^88VIP[>〉]?$/, '88VIP 入口', 1500)
+    if (!clicked) {
       let hits = _this.matches(_this.readNodes(), /^88VIP[>〉]?$/)
       if (hits.length === 0) {
         _this.pushLog('首页没有 88VIP 入口，跳过该步骤')
         return
       }
-      _this.clickNode(hits[0], '88VIP 入口')
+      clicked = _this.clickNode(hits[0], '88VIP 入口')
+    }
+    if (!clicked) {
+      _this.pushLog('88VIP 入口点不到，跳过该步骤')
+      return
     }
     sleep(2500)
     if (new Date().getTime() > deadline) {
@@ -1651,10 +2376,134 @@ function SignRunner () {
     }
   }
 
+  /**
+   * 屏幕口径对账 + 校准。
+   * 三个口径：config.device_width/height（Automator 用它校验越界）、device.width/height、
+   * 截图/控件 bounds 的真实像素。其中「截图 + 控件 bounds」才是点击真正生效的空间，
+   * 后两者比 config 大时（显示缩放、分辨率设置、折叠屏展开），合法坐标也会被判定越界。
+   */
+  this.measureScreenSpace = function () {
+    let space = screenSpace()
+    let deviceWidth = 0
+    let deviceHeight = 0
+    try {
+      deviceWidth = Number(device.width)
+      deviceHeight = Number(device.height)
+    } catch (e) {
+      deviceWidth = 0
+      deviceHeight = 0
+    }
+    let imgWidth = 0
+    let imgHeight = 0
+    try {
+      let screen = commonFunctions.captureScreen()
+      if (screen) {
+        imgWidth = Number(screen.getWidth())
+        imgHeight = Number(screen.getHeight())
+      }
+    } catch (e) {
+      imgWidth = 0
+      imgHeight = 0
+    }
+    let nodes = _this.uiNodes()
+    let maxX = 0
+    let maxY = 0
+    nodes.forEach(function (node) {
+      if (node.x2 > maxX) {
+        maxX = node.x2
+      }
+      if (node.y2 > maxY) {
+        maxY = node.y2
+      }
+    })
+    logUtils.debugInfo(['屏幕口径：config {}x{} device {}x{} 截图 {}x{} 控件最大 {}x{}（控件 {} 个）',
+      space.width, space.height, deviceWidth, deviceHeight,
+      imgWidth, imgHeight, Math.round(maxX), Math.round(maxY), nodes.length])
+    // 截图比 config 大：config 不是真实像素口径，按截图校准，否则合法坐标会被误判越界
+    if (imgWidth > 2 && imgHeight > 2
+      && (imgWidth - space.width > 2 || imgHeight - space.height > 2)) {
+      let originWidth = space.width
+      let originHeight = space.height
+      config.device_width = imgWidth
+      config.device_height = imgHeight
+      let applied = false
+      try {
+        applied = typeof automator.checkClickable === 'function'
+          ? automator.checkClickable(imgWidth - 1, imgHeight - 1)
+          : true
+      } catch (e) {
+        applied = false
+      }
+      if (applied) {
+        _this.pushWarningLog('config 屏幕尺寸 ' + originWidth + 'x' + originHeight
+          + ' 与截图 ' + imgWidth + 'x' + imgHeight + ' 不一致，已按截图校准点击范围')
+      } else {
+        config.device_width = originWidth
+        config.device_height = originHeight
+        _this.pushWarningLog('config 屏幕尺寸 ' + originWidth + 'x' + originHeight
+          + ' 与截图 ' + imgWidth + 'x' + imgHeight + ' 不一致，且 Automator 未共用配置，'
+          + '超出 ' + originWidth + 'x' + originHeight + ' 的控件一律跳过')
+      }
+    }
+    return screenSpace()
+  }
+
+  /** 当前页面开头几个中文文本，用来在日志里说明「停在了哪个页面」 */
+  this.currentPageHint = function (nodes) {
+    let texts = []
+    ;(nodes || []).forEach(function (node) {
+      let text = clean(node.text)
+      if (text && chinese(text) && texts.indexOf(text) < 0 && texts.length < 3) {
+        texts.push(text)
+      }
+    })
+    return texts.join('/') || '未知页面'
+  }
+
+  /**
+   * 开始前的启动策略（按页面状态判断，不做无条件强停）：
+   * - 不在淘宝前台：直接拉起，不强停（省 10~20 秒）
+   * - 已在首页或淘金币面板：直接沿用，不重启
+   * - 在淘宝但停在别的内页（商品页/88VIP页/搜索页/活动页）：强停重开，回到干净的首页
+   */
+  this.prepareTaobao = function () {
+    if (!_this.isInTaobao()) {
+      _this.pushLog('当前不在淘宝前台，直接打开淘宝（不强停）')
+      if (_this.tryLaunchTaobao('开始前')) {
+        return true
+      }
+      return _this.restartTaobao('开始前（直接拉起失败）')
+    }
+    let nodes = _this.readNodes()
+    if (_this.isTaskPanel(nodes)) {
+      _this.pushLog('淘宝已在前台且停在淘金币面板，跳过重启')
+      _this.handleJumpDialog(nodes)
+      return true
+    }
+    if (_this.isHomepage(nodes)) {
+      _this.pushLog('淘宝已在前台且停在首页，跳过重启')
+      _this.handleJumpDialog(nodes)
+      return true
+    }
+    _this.pushLog('淘宝已在前台但停在非首页（' + _this.currentPageHint(nodes) + '），强停重启回首页')
+    return _this.restartTaobao('开始前')
+  }
+
   this.exec = function () {
     _this.startTime = new Date().getTime()
+    // 每次 run 重置重启预算（daily.py 的 _rescan_restarts 也是按 run 清零）
+    _this.restartTimes = 0
+    _this.progressCount = 0
+    _this.noMoreTasks = false
+    _this.measureScreenSpace()
     _this.pushLog('开始淘金币日常：入口 → 签到 → 任务面板')
-    _this.launchTaobao()
+    // 淘宝停在残留内页时才强停重开，避免把上次的商品页/活动页直接拉回前台
+    if (!_this.prepareTaobao()) {
+      _this.pushErrorLog('启动淘宝失败，结束本次执行')
+      _this.logVisibleTexts('当前页面')
+      commonFunctions.minimize(PACKAGE_NAME)
+      return
+    }
     _this.ensureHomepage()
     _this.sign88Vip()
     _this.ensureHomepage()
@@ -1666,6 +2515,31 @@ function SignRunner () {
     }
     _this.pushLog('已进入淘金币页面，开始处理任务面板')
     _this.sweep()
+    // 补扫：面板说「没任务了」时，重启一次客户端再进面板复查——
+    // WebView 缓存不刷新会漏掉刚刷出来的任务（daily.py rescan + rescan_restart_app）
+    let rescans = 0
+    while (_this.noMoreTasks && rescans < OPTIONS.maxRescanRestarts && _this.withinBudget()
+      && _this.restartTimes < OPTIONS.maxRestarts) {
+      rescans++
+      _this.pushLog('第 ' + rescans + ' 次重启复查：确认面板是不是真的没有任务了')
+      _this.noMoreTasks = false
+      if (!_this.restartTaobao('补扫')) {
+        _this.pushWarningLog('补扫重启失败，结束复查')
+        break
+      }
+      _this.ensureHomepage()
+      if (!_this.enterCoinPage()) {
+        _this.pushWarningLog('补扫时未能重新进入淘金币面板')
+        break
+      }
+      let before = _this.progressCount
+      _this.sweep()
+      if (_this.progressCount === before) {
+        _this.pushLog('复查后仍没有新任务，确认收工')
+        _this.noMoreTasks = true
+        break
+      }
+    }
     // 完成判定：能进面板就说明今天的活动可达；签到成功或面板已无可执行任务才算收工
     let settled = _this.signInDone || _this.noMoreTasks || _this.progressCount > 0
     if (settled) {
