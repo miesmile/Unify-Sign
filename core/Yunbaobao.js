@@ -3545,10 +3545,14 @@ function SignRunner () {
    * @returns {boolean} 是否点了继续观看
    */
   this.handleKeepWatchingDialog = function () {
-    // 微信小游戏类广告统一不看：挽留弹窗直接「放弃不看/残忍离开」
+    // 微信小游戏类广告统一不看：挽留弹窗直接「放弃不看/残忍离开/立即退出」
     if (this._miniGameAd) {
-      if (this.giveUpWatchIfPresent()) {
-        this.pushLog('微信小游戏类广告，挽留弹窗已放弃')
+      for (let i = 0; i < 2; i++) {
+        if (this.giveUpWatchIfPresent()) {
+          this.pushLog('微信小游戏类广告，挽留弹窗已放弃')
+          return false
+        }
+        sleep(800)
       }
       return false
     }
@@ -4025,6 +4029,9 @@ function SignRunner () {
       this.pushLog('识别到微信小游戏类广告，统一不看')
       this._miniGameAd = true
       this.giveUpMiniGame()
+      // 点「立即退出」后可能停在微信（小游戏列表/聊天页），先回云宝宝，
+      // 否则后面的「观看视频后开启」「赚云币 Tab」都找不到
+      this.backToYunbaobao()
       return true
     }
     this.pushLog('识别到小程序类广告，连续按返回键直到出现「恭喜获得」')
@@ -4070,10 +4077,17 @@ function SignRunner () {
   }
 
   /**
-   * 挽留弹窗里选「放弃不看 / 残忍离开 / 关闭广告」（微信小游戏类广告统一用这个）
+   * 挽留弹窗里选「放弃不看 / 残忍离开 / 立即退出 / 关闭广告」（微信小游戏类广告统一用这个）
+   * 注意：widgetGetOne 是 textMatches 整串匹配，带 .* 的那几条才是「包含匹配」，用来兜文案变体
    */
   this.giveUpWatchIfPresent = function () {
-    let names = ['^放弃不看$', '放弃不看', '^残忍离开$', '残忍离开', '^关闭广告$', '^立即退出$', '^放弃福利$']
+    let names = [
+      '^放弃不看$', '放弃不看',
+      '^残忍离开$', '残忍离开',
+      '^立即退出$', '.*立即退出.*',
+      '(残忍退出|确定退出|退出游戏)',
+      '^关闭广告$', '^放弃福利$'
+    ]
     for (let i = 0; i < names.length; i++) {
       let btn = widgetUtils.widgetGetOne(names[i], 600, false, true)
       if (btn && automator.checkCenterClickable(btn)) {
@@ -4087,14 +4101,19 @@ function SignRunner () {
   }
 
   /**
-   * 微信小游戏类广告：点跳过 / 关叉关闭，挽留弹窗直接放弃
+   * 微信小游戏类广告：点跳过 / 关叉关闭，挽留弹窗直接放弃（点「立即退出」）
    */
   this.giveUpMiniGame = function () {
-    if (this.clickSkipOrClose()) {
-      this.giveUpWatchIfPresent()
-      return true
+    let skipped = this.clickSkipOrClose()
+    // 挽留弹窗常在点跳过/叉之后 1~2 秒才弹出来，一次 600ms 的查询容易扑空，最多重试 3 次
+    for (let i = 0; i < 3; i++) {
+      if (this.giveUpWatchIfPresent()) {
+        this.pushLog('小游戏挽留弹窗已处理（第' + (i + 1) + '次尝试命中）')
+        return true
+      }
+      sleep(800)
     }
-    if (this.giveUpWatchIfPresent()) {
+    if (skipped) {
       return true
     }
     return this.closeAdIfPossible(false, true)
