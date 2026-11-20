@@ -544,7 +544,15 @@ function SignRunner () {
     if (!nodes || nodes.length === 0) {
       return false
     }
-    return _this.hasText(nodes, PANEL_MARKERS)
+    if (_this.hasText(nodes, PANEL_MARKERS)) {
+      return true
+    }
+    // 词表兜底：淘宝改版后 list_markers 会整批失效，但「金币」+ 多个动作按钮仍然可靠。
+    // 首页也有「淘金币」图标和一两个按钮，所以必须先把首页排除掉。
+    if (_this.isHomepage(nodes)) {
+      return false
+    }
+    return _this.hasText(nodes, /金币/) && _this.looksLikeTaskPanel(nodes)
   }
 
   this.isCoinLanding = function (nodes) {
@@ -923,30 +931,116 @@ function SignRunner () {
   }
 
   /**
-   * 点首页频道里的「领淘金币 / 淘金币」入口（控件优先，OCR 兜底）
+   * 点完入口后是不是真的进了金币区域：
+   * 认得出面板/落地页最好；认不出时，只要「已经不是首页且有金币相关文字」也算进去了，
+   * 交给 handleCoinLanding 继续找任务入口或等面板——不要在这里就退回首页。
    */
-  this.tapCoinEntry = function (nodes) {
-    if (_this.clickWidget(/^(?:去|进入|领|领一下)?淘金币[>〉]?$/, '首页频道「淘金币」', 2000)) {
+  this.movedToCoinArea = function (nodes) {
+    nodes = nodes || _this.readNodes()
+    if (_this.isTaskPanel(nodes) || _this.isCoinLanding(nodes)) {
       return true
     }
+    if (_this.isHomepage(nodes)) {
+      return false
+    }
+    return _this.hasText(nodes, /淘金币|金币|赚金币|日常版/)
+  }
+
+  /**
+   * 首页「领淘金币」入口候选：控件 + OCR 两路，只留屏幕内、避开状态栏与底部栏。
+   * 同一段文字在首页常有好几颗（顶栏、频道行、悬浮卡），第一颗不一定真能跳。
+   */
+  this.coinEntryCandidates = function (nodes) {
     let width = screenSpace().width
     let height = screenSpace().height
     let candidates = []
-    _this.matches(nodes || _this.readNodes(), /^(?:去|进入|领|领一下)?淘金币[>〉]?$/).forEach(function (node) {
-      // 避开状态栏与底部导航，商品标题里也可能出现淘金币
-      if (node.cy < height * 0.12 || node.cy > height * 0.9) {
+    let seen = []
+    let add = function (key, from, fn) {
+      if (seen.indexOf(key) >= 0 || candidates.length >= 6) {
+        return
+      }
+      seen.push(key)
+      candidates.push({ from: from, click: fn })
+    }
+    try {
+      let found = widgetUtils.widgetGetAll(/^(?:去|进入|领|领一下)?淘金币[>〉]?$/, 1500, false)
+      let list = []
+      if (found && typeof found.forEach === 'function') {
+        found.forEach(function (widget) {
+          list.push(widget)
+        })
+      }
+      list.forEach(function (widget) {
+        let cx = 0
+        let cy = 0
+        try {
+          let bounds = widget.bounds()
+          cx = bounds.centerX()
+          cy = bounds.centerY()
+        } catch (e) {
+          return
+        }
+        // 屏幕外的副本（横向图标排里没展示的项）一律不留
+        if (cx < 0 || cx >= width || cy < 0 || cy >= height) {
+          return
+        }
+        if (cy < height * 0.08 || cy > height * 0.9) {
+          return
+        }
+        add('w:' + Math.round(cx / 40) + ':' + Math.round(cy / 40),
+          '控件(' + Math.round(cx) + ',' + Math.round(cy) + ')',
+          function () {
+            return _this.clickUiObject(widget, '淘金币入口')
+          })
+      })
+    } catch (e) {
+      logUtils.debugInfo(['枚举淘金币入口控件失败：{}', e])
+    }
+    _this.matches(nodes, /^(?:去|进入|领|领一下)?淘金币[>〉]?$/).forEach(function (node) {
+      if (node.cy < height * 0.08 || node.cy > height * 0.9) {
         return
       }
       if (node.cx < width * 0.03 || node.cx > width * 0.97) {
         return
       }
-      candidates.push(node)
+      add('o:' + Math.round(node.cx / 40) + ':' + Math.round(node.cy / 40),
+        'OCR(' + Math.round(node.cx) + ',' + Math.round(node.cy) + ')',
+        function () {
+          return _this.clickNode(node, '淘金币入口')
+        })
     })
-    if (candidates.length > 0) {
-      candidates.sort(function (a, b) {
-        return a.cy - b.cy
-      })
-      return _this.clickNode(candidates[0], '淘金币入口（OCR）')
+    return candidates
+  }
+
+  /**
+   * 点首页频道里的「领淘金币 / 淘金币」入口。
+   * 逐个候选点，并用「页面真的离开了首页」来验证，避免对着同一颗不生效的控件反复点。
+   */
+  this.tapCoinEntry = function (nodes) {
+    nodes = nodes || _this.readNodes()
+    let candidates = _this.coinEntryCandidates(nodes)
+    if (candidates.length === 0) {
+      _this.pushLog('首页没有找到淘金币入口')
+      return false
+    }
+    _this.pushLog('首页淘金币入口候选 ' + candidates.length + ' 个')
+    let tried = 0
+    for (let i = 0; i < candidates.length && tried < 3; i++) {
+      tried++
+      if (!candidates[i].click()) {
+        continue
+      }
+      sleep(1200)
+      let moved = _this.movedToCoinArea(_this.readNodes())
+      if (!moved) {
+        sleep(900)
+        moved = _this.movedToCoinArea(_this.readNodes())
+      }
+      if (moved) {
+        _this.pushLog('淘金币入口已点开（' + candidates[i].from + '）')
+        return true
+      }
+      _this.pushWarningLog('第 ' + tried + ' 个淘金币入口点了没反应（' + candidates[i].from + '），换下一个')
     }
     return false
   }
@@ -1288,20 +1382,33 @@ function SignRunner () {
     let daily = _this.matches(nodes, /^(?:回)?日常版$|^回日常版[>〉]?$/)
     if (daily.length > 0) {
       _this.clickNode(daily[0], '回日常版')
-      if (_this.waitForPanel(6000)) {
+      if (_this.waitForPanel(4000)) {
         return true
       }
     }
-    // 「赚更多金币 / 去赚金币」：进任务列表（coins/config.json task_entry_labels）
+    // 「赚更多金币 / 去赚金币 / 任务中心」：进任务列表（coins/config.json task_entry_labels）
     nodes = _this.readNodes()
-    let taskEntry = _this.matches(nodes, /^(?:赚更多金币|去赚金币|任务中心|做任务赚金币)[>〉]?$/)
+    if (_this.isTaskPanel(nodes)) {
+      _this.panelReached = true
+      return true
+    }
+    let taskEntry = _this.matches(nodes, /^(?:赚更多金币|去赚金币|赚金币|任务中心|金币任务|每日任务|任务列表|做任务赚金币|做任务)[>〉]?$/)
     if (taskEntry.length > 0) {
       _this.clickNode(taskEntry[0], '进入赚金币任务')
-      if (_this.waitForPanel(6000)) {
+      if (_this.waitForPanel(5000)) {
         return true
       }
     }
-    return _this.isTaskPanel(_this.readNodes())
+    let last = _this.readNodes()
+    if (_this.isTaskPanel(last)) {
+      _this.panelReached = true
+      return true
+    }
+    // 认不出来就别闷着：把这一页的文本打出来，下次补词表才有依据
+    if (!_this.isHomepage(last)) {
+      _this.logVisibleTexts('金币页未识别（可能是新版 UI）')
+    }
+    return false
   }
 
   this.enterCoinPage = function () {
@@ -1313,6 +1420,8 @@ function SignRunner () {
       _this.panelReached = true
       return true
     }
+    let searchTried = false
+    let entryFailed = false
     for (let i = 0; i < 3 && _this.withinBudget(); i++) {
       let nodes = _this.readNodes()
       if (_this.isTaskPanel(nodes)) {
@@ -1321,38 +1430,45 @@ function SignRunner () {
       }
       _this.dismissPopup(nodes)
       nodes = _this.readNodes()
-      // 首页频道里的淘金币入口
-      if (_this.tapCoinEntry(nodes)) {
-        sleep(1500)
-        _this.handleJumpDialog()
-        if (_this.handleCoinLanding()) {
-          return true
+      if (_this.isHomepage(nodes)) {
+        // 首页：先点频道入口（逐个候选验证）；入口这条路试不出结果就立刻改用搜索
+        if (!entryFailed) {
+          if (_this.tapCoinEntry(nodes)) {
+            _this.handleJumpDialog()
+            if (_this.handleCoinLanding()) {
+              return true
+            }
+            _this.pushWarningLog('入口点开了但没落到任务面板，改用搜索兜底')
+          } else {
+            _this.pushWarningLog('首页入口点不开，改用搜索兜底')
+          }
+          entryFailed = true
         }
-      }
-      // 首页入口没找到：走搜索
-      if (_this.isHomepage(_this.readNodes()) && _this.openCoinBySearch()) {
-        sleep(1500)
-        if (_this.handleCoinLanding()) {
-          return true
-        }
-      }
-      // 退一层再试（可能停在活动版/频道页）
-      if (!_this.isInTaobao()) {
-        _this.launchTaobao()
-        if (_this.isTaskPanel(_this.readNodes())) {
-          _this.panelReached = true
-          return true
+        if (!searchTried) {
+          searchTried = true
+          if (_this.openCoinBySearch()) {
+            _this.handleJumpDialog()
+            if (_this.handleCoinLanding()) {
+              return true
+            }
+          }
         }
       } else {
-        automator.back()
-        sleep(1500)
-        if (_this.isTaskPanel(_this.readNodes())) {
-          _this.panelReached = true
+        // 已经不在首页：先当金币页处理（认不出的页面也要把文本记下来）
+        if (_this.handleCoinLanding(nodes)) {
           return true
         }
       }
+      // 退一层，下一轮重新判定（下一轮多半回到首页，还能再走一次入口/搜索）
+      if (!_this.isInTaobao()) {
+        _this.launchTaobao()
+        continue
+      }
+      _this.pushLog('第 ' + (i + 1) + ' 轮没进到任务面板，退一层重试')
+      automator.back()
+      sleep(1500)
     }
-    return false
+    return _this.isTaskPanel(_this.readNodes())
   }
 
   /**
