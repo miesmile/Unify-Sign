@@ -260,9 +260,10 @@ function SignRunner () {
 
   // 单广告最大等待秒数，避免异常广告卡死
   const MAX_AD_SECONDS = 120
-  // 单次任务总超时：MainExecutor 看门狗是 15 分钟，这里 10 分钟自我收尾，
-  // 留 5 分钟余量给最后一条广告的等待（单条最长 120 秒）+ 返回清理，避免被看门狗 exit() 强杀（那就是"中途退出"）
-  const MAX_TOTAL_SECONDS = 10 * 60
+  // 单次任务总超时：MainExecutor 看门狗是 30 分钟，这里 15 分钟自我收尾，
+  // 留 15 分钟余量给最后一条广告的等待 + 返回清理，避免被看门狗 exit() 强杀（那就是"中途退出"）
+  // 15 分钟也够「看完一轮再回到惊喜礼包重跑」的循环用
+  const MAX_TOTAL_SECONDS = 15 * 60
 
   this.startTime = null
 
@@ -271,6 +272,17 @@ function SignRunner () {
    */
   this.exec = function () {
     this.startTime = new Date().getTime()
+    // 脚本被手动停止 / 被框架强制结束时也留一条日志（悬浮层此时可能已销毁，走 logUtils 落文件）
+    if (!this._exitLogRegistered) {
+      this._exitLogRegistered = true
+      try {
+        commonFunctions.registerOnEngineRemoved(function () {
+          logUtils.debugInfo('===== 云宝宝脚本已停止（手动停止或被强制结束）=====')
+        }, '云宝宝停止日志')
+      } catch (e) {
+        logUtils.debugInfo(['注册停止日志回调失败：{}', e])
+      }
+    }
     // 每次执行重置广告轮次计数与广告类型标记
     this._adCount = 0
     this._reachLimit = false
@@ -321,19 +333,48 @@ function SignRunner () {
       }
     }
     let only = this.onlySubTask
-    if (!only || only == 'giftPackage') {
-      safeRun('惊喜礼包', () => this.doGiftPackage())
+    // 跑完一轮如果还能看到新广告（入口在奖励弹窗/页面里刷新出来），就回到起点（惊喜礼包）再跑一轮，
+    // 直到「这一轮一条广告都没看成」才算所有广告都看完。指定 onlySubTask 时只跑一轮，方便测试
+    let maxRounds = only ? 1 : 5
+    let round = 0
+    while (round < maxRounds) {
+      round++
+      let beforeCount = this._adCount || 0
+      this.pushLog('----- 第' + round + '轮：惊喜礼包 → 开宝箱 → 每日打卡 → 每日看视频 -----')
+      if (!only || only == 'giftPackage') {
+        safeRun('惊喜礼包', () => this.doGiftPackage())
+      }
+      if (!only || only == 'openBox') {
+        safeRun('开宝箱赚云币', () => this.doOpenBox())
+      }
+      if (!only || only == 'dailyCheckIn') {
+        safeRun('每日打卡', () => this.doDailyCheckIn())
+      }
+      if (!only || only == 'dailyWatchVideo') {
+        safeRun('每日看视频', () => this.doDailyWatchVideo())
+      }
+      sleep(1000)
+      if (this.isTimeout()) {
+        this.pushWarningLog('已达总时长上限（' + (MAX_TOTAL_SECONDS / 60) + '分钟），停止继续重跑')
+        break
+      }
+      if (this.allSubTasksDone()) {
+        this.pushLog('全部子任务已完成，不再重跑')
+        break
+      }
+      let afterCount = this._adCount || 0
+      if (afterCount === beforeCount) {
+        this.pushLog('第' + round + '轮没有新的可看广告，视为全部看完')
+        break
+      }
+      if (round >= maxRounds) {
+        this.pushWarningLog('已跑满' + maxRounds + '轮仍有广告入口，停止重跑')
+        break
+      }
+      this.pushLog('本轮又看了' + (afterCount - beforeCount) + '条广告，回到惊喜礼包再跑一轮')
+      this.enterCoinPage()
+      sleep(1000)
     }
-    if (!only || only == 'openBox') {
-      safeRun('开宝箱赚云币', () => this.doOpenBox())
-    }
-    if (!only || only == 'dailyCheckIn') {
-      safeRun('每日打卡', () => this.doDailyCheckIn())
-    }
-    if (!only || only == 'dailyWatchVideo') {
-      safeRun('每日看视频', () => this.doDailyWatchVideo())
-    }
-    sleep(1000)
     if (this.allSubTasksDone()) {
       this.pushLog('===== 云宝宝看广告全部完成 =====')
       this.setExecuted()
@@ -353,6 +394,16 @@ function SignRunner () {
         commonFunctions.minimize(_package_name)
       } catch (e2) {
         // 忽略
+      }
+    } finally {
+      // 无论正常结束、超时收尾还是异常终止，都打一条明确的停止日志
+      try {
+        let costSec = Math.round((new Date().getTime() - this.startTime) / 1000)
+        let costText = (costSec >= 60 ? Math.floor(costSec / 60) + '分' : '') + (costSec % 60) + '秒'
+        this.pushLog('===== 云宝宝脚本结束（耗时' + costText + '，共看' + (this._adCount || 0) + '条广告）=====')
+        logUtils.debugInfo(['===== 云宝宝脚本结束（耗时{}，共看{}条广告）=====', costText, (this._adCount || 0)])
+      } catch (e3) {
+        logUtils.debugInfo(['打印结束日志异常：{}', e3])
       }
     }
   }
