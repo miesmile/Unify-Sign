@@ -371,7 +371,16 @@ function SignRunner () {
         this.pushWarningLog('已跑满' + maxRounds + '轮仍有广告入口，停止重跑')
         break
       }
-      this.pushLog('本轮又看了' + (afterCount - beforeCount) + '条广告，回到惊喜礼包再跑一轮')
+      // 从头再来之前先停掉云宝宝进程再重新打开：
+      // 只回退页面时，残留的奖励弹窗/广告页/内页会盖在赚云币页上，下一轮照样点不到入口
+      this.pushLog('本轮又看了' + (afterCount - beforeCount) + '条广告，关闭云宝宝再重新打开，从惊喜礼包从头开始')
+      try {
+        this.openYunbaobao()
+      } catch (e) {
+        this.pushWarningLog('轮间重启云宝宝异常：' + e)
+      }
+      sleep(1000)
+      this.skipDialogIfPresent()
       this.enterCoinPage()
       sleep(1000)
     }
