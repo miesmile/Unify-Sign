@@ -27,6 +27,7 @@ let widgetUtils = singletonRequire('WidgetUtils')
 let logUtils = singletonRequire('LogUtils')
 let automator = singletonRequire('Automator')
 let localOcrUtil = require('../lib/LocalOcrUtil.js')
+let runningQueueDispatcher = singletonRequire('RunningQueueDispatcher')
 
 let BaseSignRunner = require('./BaseSignRunner.js')
 
@@ -260,10 +261,10 @@ function SignRunner () {
 
   // 单广告最大等待秒数，避免异常广告卡死
   const MAX_AD_SECONDS = 120
-  // 单次任务总超时：MainExecutor 看门狗是 30 分钟，这里 15 分钟自我收尾，
-  // 留 15 分钟余量给最后一条广告的等待 + 返回清理，避免被看门狗 exit() 强杀（那就是"中途退出"）
-  // 15 分钟也够「看完一轮再回到惊喜礼包重跑」的循环用
-  const MAX_TOTAL_SECONDS = 15 * 60
+  // 单次任务总超时：MainExecutor 看门狗对云宝宝放宽到 70 分钟，这里 60 分钟自我收尾，
+  // 留 10 分钟余量给最后一条广告的等待 + 返回清理，避免被看门狗 exit() 强杀（那就是"中途退出"）
+  // 60 分钟足够「看完一轮再回到惊喜礼包重跑」的循环用
+  const MAX_TOTAL_SECONDS = 60 * 60
 
   this.startTime = null
 
@@ -290,6 +291,8 @@ function SignRunner () {
     this._restarting = false
     // 单次执行内最多重启 2 次：页面异常时每轮都强停重开会让整个脚本十几分钟出不来
     this._restartTimes = 0
+    // 运行中标记的续期时间戳：进任务时框架已续期一次，这里从当前时间起算
+    this._lastRenewRunningAt = new Date().getTime()
     // 启动失败后「强停再拉起」只做一次，避免失败-重启-再失败的死循环
     this._relaunching = false
     // 关闭叉识图失败时间戳：同一屏连续调用时避免重复做整轮匹配
@@ -421,10 +424,30 @@ function SignRunner () {
     return this.subTasks.filter(task => task.enabled !== false).every(task => this.isSubTaskExecuted(task, true))
   }
 
+  /**
+   * 长任务续期：框架的「运行中任务」标记默认 15 分钟过期，
+   * 现在单次执行最长 60 分钟，必须在中途定期续期，
+   * 否则过期后调度器会认为没有任务在跑，并发拉起另一个脚本把当前点击流程打断
+   * （表现就是"十几分钟就莫名其妙停了"）
+   */
+  this.renewRunningFlagIfNeeded = function () {
+    let now = new Date().getTime()
+    if (now - (this._lastRenewRunningAt || 0) < 4 * 60 * 1000) {
+      return
+    }
+    this._lastRenewRunningAt = now
+    try {
+      runningQueueDispatcher.renewalRunningTask(10, true)
+    } catch (e) {
+      logUtils.debugInfo(['运行中标记续期异常：{}', e])
+    }
+  }
+
   this.isTimeout = function () {
     if (!this.startTime) {
       return false
     }
+    this.renewRunningFlagIfNeeded()
     return new Date().getTime() - this.startTime > MAX_TOTAL_SECONDS * 1000
   }
 
@@ -1777,10 +1800,10 @@ function SignRunner () {
     let maxWatch = 10
     let watched = 0
     let finished = false
-    // 本任务预算：10 条广告 × 约 40 秒 ≈ 7 分钟，给 5 分钟上限，
-    // 超了就先把本条任务收尾，避免一条任务把整轮 8.5 分钟预算全吃光、看着像卡死
+    // 本任务预算：10 条广告 × 约 40 秒 ≈ 7 分钟，给 10 分钟上限（总预算已放宽到 60 分钟），
+    // 超了就先把本条任务收尾，避免一直点不动把整轮时间耗光、看着像卡死
     let taskStart = new Date().getTime()
-    let taskBudget = 5 * 60 * 1000
+    let taskBudget = 10 * 60 * 1000
     // 进度未增长的连续次数：入口点不动/今日次数已用完时会一直空转，连续 2 次就收工
     let lastProgress = -1
     let noProgress = 0
